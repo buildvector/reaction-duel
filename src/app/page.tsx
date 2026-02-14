@@ -62,16 +62,11 @@ function short(pk?: string) {
   if (!pk) return "—";
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
-
-/**
- * ✅ Make IDs effectively collision-proof (timestamp + random).
- */
 function makeDuelId() {
   const a = Math.random().toString(36).slice(2, 6).toUpperCase();
   const b = Date.now().toString(36).slice(-4).toUpperCase();
-  return `${a}${b}`; // e.g. "K9QX2F8D"
+  return `${a}${b}`;
 }
-
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -122,39 +117,21 @@ async function getTreasuryPubkey(): Promise<string> {
 
 function Card(props: { children: React.ReactNode; style?: React.CSSProperties }) {
   return (
-    <section
-      className="glass glass-rim glass-noise"
-      style={{
-        borderRadius: 18,
-        padding: 18,
-        ...props.style,
-      }}
-    >
+    <section className="glass glass-rim glass-noise" style={{ borderRadius: 18, padding: 18, ...props.style }}>
       {props.children}
     </section>
   );
 }
-
 function Label(props: { children: React.ReactNode; style?: React.CSSProperties }) {
   return (
-    <div
-      style={{
-        fontSize: 11,
-        letterSpacing: 1.2,
-        textTransform: "uppercase",
-        color: "var(--muted)",
-        ...props.style,
-      }}
-    >
+    <div style={{ fontSize: 11, letterSpacing: 1.2, textTransform: "uppercase", color: "var(--muted)", ...props.style }}>
       {props.children}
     </div>
   );
 }
-
 function Hint(props: { children: React.ReactNode; style?: React.CSSProperties }) {
   return <div style={{ fontSize: 12, color: "rgba(231,234,242,0.65)", ...props.style }}>{props.children}</div>;
 }
-
 function Mono(props: { children: React.ReactNode; style?: React.CSSProperties }) {
   return (
     <div className="mono" style={{ fontSize: 12, ...props.style }}>
@@ -162,7 +139,6 @@ function Mono(props: { children: React.ReactNode; style?: React.CSSProperties })
     </div>
   );
 }
-
 function Pill(props: { label: string; tone?: "neutral" | "purple" | "green" | "red" }) {
   const tone = props.tone ?? "neutral";
   const shadow =
@@ -193,7 +169,6 @@ function Pill(props: { label: string; tone?: "neutral" | "purple" | "green" | "r
     </span>
   );
 }
-
 function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
@@ -211,7 +186,6 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
     />
   );
 }
-
 function Button(props: {
   children: React.ReactNode;
   onClick?: () => void;
@@ -278,7 +252,7 @@ export default function Page() {
 
   const [mounted, setMounted] = useState(false);
 
-  // stable time: uiNow = Date.now() + offset
+  // ✅ server-synced clock
   const offsetRef = useRef<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(Date.now());
   const uiNow = () => Date.now() + (offsetRef.current ?? 0);
@@ -297,11 +271,11 @@ export default function Page() {
   const duelId = duel?.duelId ?? null;
 
   const myRole = useMemo<"A" | "B" | null>(() => {
-    if (!duel || !connected) return null;
+    if (!duel || !connected || !publicKey) return null; // ✅ require publicKey, not only connected
     if (duel.createdBy === me) return "A";
     if (duel.joinedBy === me) return "B";
     return null;
-  }, [duel, connected, me]);
+  }, [duel, connected, publicKey, me]);
 
   // Poll active duel
   useEffect(() => {
@@ -319,7 +293,6 @@ export default function Page() {
 
         if (typeof serverNow === "number") {
           const targetOffset = serverNow - Date.now();
-
           if (offsetRef.current == null) {
             offsetRef.current = targetOffset;
           } else {
@@ -370,6 +343,7 @@ export default function Page() {
     };
   }, [duelId]);
 
+  // payout loop
   const payoutInFlight = useRef(false);
   useEffect(() => {
     const run = async () => {
@@ -407,14 +381,10 @@ export default function Page() {
     } catch {}
 
     for (let i = 0; i < 30; i++) {
-      try {
-        const st = await connection.getSignatureStatuses([sig]);
-        const s = st?.value?.[0];
-        if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") return true;
-        if (s?.err) throw new Error("TX_FAILED");
-      } catch (e) {
-        if ((e as any)?.message === "TX_FAILED") throw e;
-      }
+      const st = await connection.getSignatureStatuses([sig]);
+      const s = st?.value?.[0];
+      if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") return true;
+      if (s?.err) throw new Error("TX_FAILED");
       await sleep(2000);
     }
     return false;
@@ -433,15 +403,12 @@ export default function Page() {
     );
 
     const sig = await sendTransaction(tx, connection, { skipPreflight: false });
-
-    const ok = await confirmSigRobust(sig);
-    if (!ok) console.warn("TX not confirmed in time (continuing anyway):", sig);
-
+    await confirmSigRobust(sig).catch(() => null);
     return sig;
   }
 
   async function createDuelPaid() {
-    if (!connected) return;
+    if (!connected || !publicKey) return;
     setLoading("create");
     try {
       const id = makeDuelId();
@@ -466,7 +433,7 @@ export default function Page() {
   }
 
   async function joinDuelPaid(codeIn?: string) {
-    if (!connected) return;
+    if (!connected || !publicKey) return;
     const code = (codeIn ?? "").trim().toUpperCase();
     if (!code) return;
 
@@ -494,28 +461,39 @@ export default function Page() {
     }
   }
 
+  // ✅ READY: require publicKey + lock inFlight + optimistic UI
+  const readyInFlight = useRef(false);
   async function readyUp() {
-    if (!connected || !duel) return;
+    if (!connected || !publicKey || !duel) return;
+    if (!me) return;
+
+    if (readyInFlight.current) return;
+    readyInFlight.current = true;
+
     setLoading("ready");
     try {
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/ready", {
         duelId: duel.duelId,
         pubkey: me,
       });
-      setDuel(next);
+
+      // optimistic merge in case server returns slightly stale
+      setDuel((prev) => {
+        if (!prev) return next;
+        if (prev.duelId !== next.duelId) return next;
+        const merged = { ...prev, ...next };
+        if (myRole === "A") merged.readyA = true;
+        if (myRole === "B") merged.readyB = true;
+        return merged as Duel;
+      });
     } catch (e: any) {
       alert(e?.message ?? "Ready failed");
     } finally {
       setLoading(null);
+      readyInFlight.current = false;
     }
   }
 
-  const clickedLocalRef = useRef(false);
-  useEffect(() => {
-    clickedLocalRef.current = false;
-  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
-
-  // Derived phase
   const displayPhase: DuelPhase = useMemo(() => {
     if (!duel) return "lobby";
     if (duel.phase === "finished") return "finished";
@@ -526,28 +504,29 @@ export default function Page() {
       if (t < duel.goAt) return "waiting_random";
       return "go";
     }
-
     if (duel.phase !== "lobby") return duel.phase;
     return "lobby";
   }, [duel, nowMs]);
 
-  // ✅ Grace window so first click at the transition counts
+  // ✅ GO grace
   function isGoOrJustBecameGo() {
     if (!duel?.goAt) return displayPhase === "go";
     const t = nowMs || Date.now();
-    const GRACE_MS = 160; // allow click slightly before UI flips
+    const GRACE_MS = 350;
     return t >= duel.goAt - GRACE_MS;
   }
 
+  // ✅ click: use server-synced time, not local Date.now()
+  const clickedLocalRef = useRef(false);
+  useEffect(() => {
+    clickedLocalRef.current = false;
+  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
+
   async function clickDuel() {
     if (!duel) return;
-    if (!myRole) {
-      alert("You are not a participant in this duel.");
-      return;
-    }
+    if (!myRole) return;
     if (duel.phase === "finished") return;
 
-    // ✅ allow click if GO or within grace window
     if (!isGoOrJustBecameGo()) return;
 
     if (clickedLocalRef.current) return;
@@ -557,7 +536,7 @@ export default function Page() {
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/click", {
         duelId: duel.duelId,
         who: myRole,
-        clickedAt: Date.now(),
+        clickedAt: uiNow(), // ✅ IMPORTANT
       });
       setDuel(next);
     } catch (e: any) {
@@ -573,8 +552,6 @@ export default function Page() {
   const feeLamports = duel ? Math.floor((duel.stakeLamports * duel.feeBps) / 10_000) : 0;
   const netLamports = duel ? Math.max(0, duel.stakeLamports - feeLamports) : 0;
   const potLamports = duel ? netLamports * 2 : 0;
-
-  const feePct = "3";
 
   const countdownText = useMemo(() => {
     if (!mounted) return "";
@@ -618,7 +595,6 @@ export default function Page() {
   const iAmReady = myRole === "A" ? !!duel?.readyA : myRole === "B" ? !!duel?.readyB : false;
   const bothReady = !!duel?.readyA && !!duel?.readyB;
 
-  // ✅ winner text
   const iWon = useMemo(() => {
     if (!duel || duel.phase !== "finished" || !duel.winner || !myRole) return null;
     return duel.winner === myRole;
@@ -653,10 +629,7 @@ export default function Page() {
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 800 }}>Create duel</div>
-                    <Hint style={{ marginTop: 6 }}>
-                      Deposit goes to treasury. <span style={{ color: "rgba(231,234,242,0.9)" }}>{feePct}%</span> fee is taken
-                      instantly.
-                    </Hint>
+                    <Hint style={{ marginTop: 6 }}>Deposit goes to treasury. 3% fee is taken instantly.</Hint>
                   </div>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>min {MIN_BET} SOL</div>
                 </div>
@@ -707,7 +680,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || loading === "create"} style={{ minWidth: 170 }}>
+                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
                     {loading === "create" ? "Creating…" : "Create & deposit"}
                   </Button>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
@@ -769,7 +742,7 @@ export default function Page() {
                         <div style={{ display: "flex", gap: 10 }}>
                           <Button
                             variant="primary"
-                            disabled={!connected || loading === "join" || r.createdBy === me}
+                            disabled={!connected || !publicKey || loading === "join" || r.createdBy === me}
                             onClick={() => joinDuelPaid(r.duelId)}
                             style={{ minWidth: 120 }}
                           >
@@ -803,8 +776,7 @@ export default function Page() {
                   </div>
 
                   <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
-                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Fee:{" "}
-                    <b>{solFromLamports(feeLamports).toFixed(4)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
+                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
                   </div>
 
                   <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
@@ -837,23 +809,16 @@ export default function Page() {
                 <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                   <Button
                     variant="primary"
-                    disabled={!connected || !myRole || loading === "ready" || iAmReady}
+                    disabled={!connected || !publicKey || !myRole || loading === "ready" || readyInFlight.current || iAmReady}
                     onClick={readyUp}
                     style={{ minWidth: 150 }}
                   >
                     {iAmReady ? "READY ✅" : loading === "ready" ? "Setting…" : "READY"}
                   </Button>
-                  <Hint>
-                    {bothReady
-                      ? "Both ready → starting…"
-                      : readyCountdown != null
-                      ? `Auto-start in ${readyCountdown}s (or when both ready).`
-                      : "Start happens when both ready OR after 30 seconds."}
-                  </Hint>
+                  <Hint>{bothReady ? "Both ready → starting…" : `Auto-start in ${readyCountdown ?? "—"}s (or when both ready).`}</Hint>
                 </div>
               ) : null}
 
-              {/* ✅ IMPORTANT: only pointerdown (no onClick) so we don't double-fire */}
               <div
                 onPointerDown={(e) => {
                   e.preventDefault();
@@ -889,29 +854,12 @@ export default function Page() {
                   </div>
                 ) : duel.phase === "finished" ? (
                   <div style={{ textAlign: "center" }}>
-                    <div style={{ fontSize: 18, fontWeight: 900 }}>Result</div>
-
-                    {/* ✅ WIN/LOSE headline */}
-                    <div style={{ marginTop: 10, fontSize: 44, fontWeight: 950 }}>
-                      {iWon == null ? "DONE" : iWon ? "YOU WIN" : "YOU LOSE"}
-                    </div>
-
+                    <div style={{ fontSize: 44, fontWeight: 950 }}>{iWon == null ? "DONE" : iWon ? "YOU WIN" : "YOU LOSE"}</div>
                     <div style={{ marginTop: 10, color: "rgba(231,234,242,0.85)" }}>
                       A: <b>{duel.clickA ?? "—"}</b> ms &nbsp; | &nbsp; B: <b>{duel.clickB ?? "—"}</b> ms
                     </div>
-
-                    <div style={{ marginTop: 10, fontSize: 16, color: "rgba(231,234,242,0.70)" }}>
-                      Winner: <b>{duel.winner ?? "—"}</b>
-                    </div>
-
                     <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>
                       {duel.payoutSig ? "Payout sent ✅" : "Paying out…"}
-                    </div>
-
-                    <div style={{ marginTop: 14, display: "flex", justifyContent: "center" }}>
-                      <Button variant="primary" onClick={reset} style={{ minWidth: 190 }}>
-                        Back to lobby
-                      </Button>
                     </div>
                   </div>
                 ) : (
@@ -923,7 +871,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Lobby: auto-start at 30s (readyDeadlineAt). Start: 3-2-1 (revealAt), then random delay (goAt), then GO.
+                Click timing uses server-synced clock to avoid “green click rejected”.
               </div>
             </Card>
           </div>
