@@ -80,8 +80,22 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
   return j as T;
 }
 
+/**
+ * IMPORTANT: no-store + cache-bust to avoid Chrome/Vercel/CDN serving stale duel state.
+ */
 async function getJSON<T>(url: string): Promise<T> {
-  const r = await fetch(url, { method: "GET" });
+  const u = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
+  u.searchParams.set("_ts", String(Date.now()));
+
+  const r = await fetch(u.toString(), {
+    method: "GET",
+    cache: "no-store",
+    headers: {
+      "Cache-Control": "no-store",
+      Pragma: "no-cache",
+    },
+  });
+
   const j = await r.json();
   if (!r.ok) throw new Error(j?.error ?? "REQUEST_FAILED");
   return j as T;
@@ -90,7 +104,13 @@ async function getJSON<T>(url: string): Promise<T> {
 let _treasuryPkCache: string | null = null;
 async function getTreasuryPubkey(): Promise<string> {
   if (_treasuryPkCache) return _treasuryPkCache;
-  const r = await fetch("/api/duel/config", { method: "GET" });
+
+  const r = await fetch(`/api/duel/config?_ts=${Date.now()}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: { "Cache-Control": "no-store", Pragma: "no-cache" },
+  });
+
   const j = await r.json();
   if (!r.ok) throw new Error(j?.error ?? "CONFIG_FAILED");
   _treasuryPkCache = String(j.treasuryPubkey);
@@ -265,7 +285,7 @@ export default function Page() {
     setNowMs(Date.now());
   }, []);
 
-  // 60Hz "clock" for UI countdowns (no reliance on websocket timings)
+  // 20Hz local clock for UI countdowns (independent of server polling jitter)
   useEffect(() => {
     if (!mounted) return;
     const i = setInterval(() => setNowMs(Date.now()), 50);
@@ -293,8 +313,6 @@ export default function Page() {
         );
         if (!alive) return;
         setDuel(fresh);
-
-        // Prefer serverNow if present, else local
         setNowMs(typeof serverNow === "number" ? serverNow : Date.now());
       } catch {}
     };
@@ -367,23 +385,19 @@ export default function Page() {
     return Array.from(map.values());
   }, [historyDuels]);
 
-  // ✅ New: derive display phase even if server phase lags
   const displayPhase: DuelPhase = useMemo(() => {
     if (!duel) return "lobby";
     if (duel.phase === "finished") return "finished";
 
     const t = nowMs || Date.now();
 
-    // If revealAt/goAt exist, use them to drive UI
     if (duel.revealAt && duel.goAt) {
       if (t < duel.revealAt) return "countdown";
       if (t < duel.goAt) return "waiting_random";
       return "go";
     }
 
-    // If we are past lobby (server might set "countdown"/"waiting_random"/"go" without timestamps)
     if (duel.phase !== "lobby") return duel.phase;
-
     return "lobby";
   }, [duel, nowMs]);
 
@@ -418,7 +432,6 @@ export default function Page() {
     run();
   }, [duel?.phase, duel?.winner, duel?.payoutSig, duel?.duelId]);
 
-  // Confirm helper (unchanged from your working version)
   async function confirmSigRobust(sig: string) {
     try {
       const latest = await connection.getLatestBlockhash("confirmed");
@@ -541,7 +554,6 @@ export default function Page() {
     }
     if (duel.phase === "finished") return;
 
-    // only allow clicking when GO
     if (displayPhase !== "go") return;
 
     if (clickedLocalRef.current) return;
@@ -570,7 +582,6 @@ export default function Page() {
 
   const feePct = "3";
 
-  // ✅ 3-2-1 countdown derived from revealAt even if server phase is still "lobby"
   const countdownText = useMemo(() => {
     if (!mounted) return "";
     if (!duel?.revealAt) return "";
@@ -583,7 +594,6 @@ export default function Page() {
     return "";
   }, [mounted, duel?.revealAt, nowMs]);
 
-  // ✅ 30s lobby countdown always shown when both players exist
   const readyCountdown = useMemo(() => {
     if (!duel?.readyDeadlineAt) return null;
     const t = nowMs || Date.now();
@@ -639,7 +649,6 @@ export default function Page() {
         {!duel ? (
           <div style={{ marginTop: 26, display: "grid", gap: 16, gridTemplateColumns: "1fr 1fr" }}>
             <div style={{ display: "grid", gap: 16 }}>
-              {/* Create */}
               <Card>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <div>
@@ -676,9 +685,7 @@ export default function Page() {
                           }}
                         >
                           <div style={{ fontSize: 14, fontWeight: 800 }}>{x} SOL</div>
-                          <div style={{ fontSize: 12, opacity: active ? 0.7 : 0.65 }}>
-                            {active ? "Selected" : "Click to select"}
-                          </div>
+                          <div style={{ fontSize: 12, opacity: active ? 0.7 : 0.65 }}>{active ? "Selected" : "Click to select"}</div>
                         </button>
                       );
                     })}
@@ -713,9 +720,56 @@ export default function Page() {
                   </div>
                 </div>
               </Card>
+
+              {/* Optional: keep your history card if you want (your snippet had removed it) */}
+              {historyUnique.length > 0 ? (
+                <Card>
+                  <div style={{ fontSize: 14, fontWeight: 800 }}>History</div>
+                  <Hint style={{ marginTop: 6 }}>Your latest 10 duels (creator or joiner).</Hint>
+
+                  <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
+                    {historyUnique.map((r) => (
+                      <div
+                        key={r.duelId}
+                        onClick={() => setDuel(r)}
+                        className="glass"
+                        style={{
+                          borderRadius: 16,
+                          padding: 12,
+                          cursor: "pointer",
+                          border: "1px solid rgba(255,255,255,0.10)",
+                          background: "rgba(255,255,255,0.05)",
+                        }}
+                        title="Click to open"
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                              <div style={{ fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
+                              <Hint>
+                                duel{" "}
+                                <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
+                                  {r.duelId}
+                                </span>
+                              </Hint>
+                            </div>
+
+                            <div style={{ marginTop: 6, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                              A {short(r.createdBy)} · B {r.joinedBy ? short(r.joinedBy) : "—"}
+                            </div>
+                          </div>
+
+                          <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)", whiteSpace: "nowrap" }}>
+                            {new Date(r.updatedAt).toLocaleString()}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+              ) : null}
             </div>
 
-            {/* Open duels */}
             <Card>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
                 <div>
@@ -746,9 +800,7 @@ export default function Page() {
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
                         <div style={{ minWidth: 0 }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                            <div style={{ fontSize: 18, fontWeight: 800 }}>
-                              {solFromLamports(r.stakeLamports).toFixed(2)} SOL
-                            </div>
+                            <div style={{ fontSize: 18, fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
                             <Pill label={r.joinedBy ? "reserved" : "open"} tone={r.joinedBy ? "purple" : "green"} />
                           </div>
 
@@ -796,10 +848,21 @@ export default function Page() {
                   <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                     <Pill
                       label={`phase: ${displayPhase}`}
-                      tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : displayPhase === "countdown" ? "purple" : "neutral"}
+                      tone={
+                        displayPhase === "go"
+                          ? "green"
+                          : displayPhase === "waiting_random"
+                          ? "purple"
+                          : displayPhase === "countdown"
+                          ? "purple"
+                          : "neutral"
+                      }
                     />
                     {duel.phase === "finished" ? (
-                      <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
+                      <Pill
+                        label={duel.payoutSig ? "payout: sent" : "payout: pending"}
+                        tone={duel.payoutSig ? "green" : "purple"}
+                      />
                     ) : null}
                   </div>
 
@@ -828,7 +891,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <Button variant="ghost" onClick={reset} style={{ opacity: 0.9 }}>
+                  <Button variant="ghost" onClick={() => setDuel(null)} style={{ opacity: 0.9 }}>
                     Back to lobby
                   </Button>
                 </div>
@@ -879,11 +942,7 @@ export default function Page() {
               >
                 {duel.phase === "lobby" ? (
                   <div style={{ textAlign: "center", color: "rgba(231,234,242,0.80)" }}>
-                    {!duel.joinedBy
-                      ? "Waiting for Player B…"
-                      : bothReady
-                      ? "Starting… (waiting for server timestamps)"
-                      : `Ready up! Auto-start in ${readyCountdown ?? "—"}s.`}
+                    {!duel.joinedBy ? "Waiting for Player B…" : bothReady ? "Starting…" : `Ready up! Auto-start in ${readyCountdown ?? "—"}s.`}
                   </div>
                 ) : displayPhase === "countdown" ? (
                   <div style={{ textAlign: "center" }}>
@@ -909,7 +968,7 @@ export default function Page() {
                     </div>
 
                     <div style={{ marginTop: 14, display: "flex", justifyContent: "center" }}>
-                      <Button variant="primary" onClick={reset} style={{ minWidth: 190 }}>
+                      <Button variant="primary" onClick={() => setDuel(null)} style={{ minWidth: 190 }}>
                         Back to lobby
                       </Button>
                     </div>
