@@ -97,7 +97,7 @@ async function getTreasuryPubkey(): Promise<string> {
   return _treasuryPkCache;
 }
 
-/* ----------------- Small “Flip-like” UI primitives (no Tailwind needed) ----------------- */
+/* ----------------- UI primitives ----------------- */
 
 function Card(props: { children: React.ReactNode; style?: React.CSSProperties }) {
   return (
@@ -265,9 +265,10 @@ export default function Page() {
     setNowMs(Date.now());
   }, []);
 
+  // 60Hz "clock" for UI countdowns (no reliance on websocket timings)
   useEffect(() => {
     if (!mounted) return;
-    const i = setInterval(() => setNowMs(Date.now()), 30);
+    const i = setInterval(() => setNowMs(Date.now()), 50);
     return () => clearInterval(i);
   }, [mounted]);
 
@@ -280,6 +281,7 @@ export default function Page() {
     return null;
   }, [duel, connected, me]);
 
+  // Poll active duel
   useEffect(() => {
     if (!duelId) return;
     let alive = true;
@@ -291,7 +293,9 @@ export default function Page() {
         );
         if (!alive) return;
         setDuel(fresh);
-        setNowMs(serverNow ?? Date.now());
+
+        // Prefer serverNow if present, else local
+        setNowMs(typeof serverNow === "number" ? serverNow : Date.now());
       } catch {}
     };
 
@@ -363,15 +367,24 @@ export default function Page() {
     return Array.from(map.values());
   }, [historyDuels]);
 
+  // ✅ New: derive display phase even if server phase lags
   const displayPhase: DuelPhase = useMemo(() => {
     if (!duel) return "lobby";
     if (duel.phase === "finished") return "finished";
-    if (!duel.revealAt || !duel.goAt) return duel.phase;
 
     const t = nowMs || Date.now();
-    if (t < duel.revealAt) return "countdown";
-    if (t < duel.goAt) return "waiting_random";
-    return "go";
+
+    // If revealAt/goAt exist, use them to drive UI
+    if (duel.revealAt && duel.goAt) {
+      if (t < duel.revealAt) return "countdown";
+      if (t < duel.goAt) return "waiting_random";
+      return "go";
+    }
+
+    // If we are past lobby (server might set "countdown"/"waiting_random"/"go" without timestamps)
+    if (duel.phase !== "lobby") return duel.phase;
+
+    return "lobby";
   }, [duel, nowMs]);
 
   const clickedLocalRef = useRef(false);
@@ -405,9 +418,8 @@ export default function Page() {
     run();
   }, [duel?.phase, duel?.winner, duel?.payoutSig, duel?.duelId]);
 
-  // ---- NEW: robust confirm for Chrome/WS issues ----
+  // Confirm helper (unchanged from your working version)
   async function confirmSigRobust(sig: string) {
-    // 1) Prefer blockhash-based confirmation (more reliable than confirmTransaction(sig))
     try {
       const latest = await connection.getLatestBlockhash("confirmed");
       await connection.confirmTransaction(
@@ -417,7 +429,6 @@ export default function Page() {
       return true;
     } catch {}
 
-    // 2) Fallback polling (no websockets)
     for (let i = 0; i < 30; i++) {
       try {
         const st = await connection.getSignatureStatuses([sig]);
@@ -425,7 +436,6 @@ export default function Page() {
         if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") return true;
         if (s?.err) throw new Error("TX_FAILED");
       } catch (e) {
-        // if it explicitly failed, bubble up
         if ((e as any)?.message === "TX_FAILED") throw e;
       }
       await sleep(2000);
@@ -447,11 +457,8 @@ export default function Page() {
 
     const sig = await sendTransaction(tx, connection, { skipPreflight: false });
 
-    // Robust confirm: if it times out, continue anyway (prevents "SOL sent but duel not created")
     const ok = await confirmSigRobust(sig);
-    if (!ok) {
-      console.warn("TX not confirmed in time (continuing anyway):", sig);
-    }
+    if (!ok) console.warn("TX not confirmed in time (continuing anyway):", sig);
 
     return sig;
   }
@@ -533,7 +540,9 @@ export default function Page() {
       return;
     }
     if (duel.phase === "finished") return;
-    if (!duel.revealAt || !duel.goAt) return;
+
+    // only allow clicking when GO
+    if (displayPhase !== "go") return;
 
     if (clickedLocalRef.current) return;
     clickedLocalRef.current = true;
@@ -561,17 +570,26 @@ export default function Page() {
 
   const feePct = "3";
 
+  // ✅ 3-2-1 countdown derived from revealAt even if server phase is still "lobby"
   const countdownText = useMemo(() => {
     if (!mounted) return "";
     if (!duel?.revealAt) return "";
-    if (displayPhase !== "countdown") return "";
-    const ms = duel.revealAt - nowMs;
+    const t = nowMs || Date.now();
+    const ms = duel.revealAt - t;
     const secs = Math.max(0, Math.ceil(ms / 1000));
     if (secs >= 3) return "3";
     if (secs === 2) return "2";
     if (secs === 1) return "1";
     return "";
-  }, [mounted, duel?.revealAt, nowMs, displayPhase]);
+  }, [mounted, duel?.revealAt, nowMs]);
+
+  // ✅ 30s lobby countdown always shown when both players exist
+  const readyCountdown = useMemo(() => {
+    if (!duel?.readyDeadlineAt) return null;
+    const t = nowMs || Date.now();
+    const ms = duel.readyDeadlineAt - t;
+    return Math.max(0, Math.ceil(ms / 1000));
+  }, [duel?.readyDeadlineAt, nowMs]);
 
   const parsedCustom = useMemo(() => {
     const n = Number(String(custom).replace(",", "."));
@@ -593,12 +611,6 @@ export default function Page() {
     setStakeSol(Number(parsedCustom.toFixed(4)));
   };
 
-  const readyCountdown = useMemo(() => {
-    if (!duel?.readyDeadlineAt) return null;
-    const ms = duel.readyDeadlineAt - nowMs;
-    return Math.max(0, Math.ceil(ms / 1000));
-  }, [duel?.readyDeadlineAt, nowMs]);
-
   const iAmReady = myRole === "A" ? !!duel?.readyA : myRole === "B" ? !!duel?.readyB : false;
   const bothReady = !!duel?.readyA && !!duel?.readyB;
 
@@ -607,6 +619,8 @@ export default function Page() {
       ? "rgba(0, 255, 160, 0.10)"
       : displayPhase === "waiting_random"
       ? "rgba(255, 200, 0, 0.07)"
+      : displayPhase === "countdown"
+      ? "rgba(124,58,237,0.10)"
       : "rgba(255,255,255,0.03)";
 
   return (
@@ -685,45 +699,6 @@ export default function Page() {
                   </div>
                 </div>
 
-                <div
-                  style={{
-                    marginTop: 16,
-                    borderRadius: 18,
-                    border: "1px solid rgba(255,255,255,0.10)",
-                    background: "rgba(255,255,255,0.05)",
-                    padding: 14,
-                  }}
-                >
-                  {(() => {
-                    const stakeLamports = lamportsFromSol(stakeSol);
-                    const fee = Math.max(1, Math.floor((stakeLamports * 300) / 10_000));
-                    const net = Math.max(0, stakeLamports - fee);
-                    const payout = net * 2;
-                    return (
-                      <>
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                          <Hint>Fee ({feePct}%)</Hint>
-                          <Mono style={{ color: "rgba(231,234,242,0.9)" }}>{(fee / 1e9).toFixed(6)} SOL</Mono>
-                        </div>
-                        <div style={{ marginTop: 8, display: "flex", justifyContent: "space-between", gap: 10 }}>
-                          <Hint>Net (after fee)</Hint>
-                          <Mono style={{ color: "rgba(231,234,242,0.95)" }}>{(net / 1e9).toFixed(6)} SOL</Mono>
-                        </div>
-
-                        <div style={{ marginTop: 12, height: 1, background: "rgba(255,255,255,0.10)" }} />
-
-                        <div style={{ marginTop: 12, display: "flex", justifyContent: "space-between", gap: 10 }}>
-                          <Hint>Potential payout</Hint>
-                          <Mono style={{ color: "rgba(231,234,242,0.95)" }}>{(payout / 1e9).toFixed(6)} SOL</Mono>
-                        </div>
-                        <div style={{ marginTop: 6, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                          Winner receives both nets (2×). No house edge.
-                        </div>
-                      </>
-                    );
-                  })()}
-                </div>
-
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
                   <Button
                     variant="primary"
@@ -736,73 +711,6 @@ export default function Page() {
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
                     {connected ? "You will sign a transfer in Phantom." : "Connect a wallet to play."}
                   </div>
-                </div>
-              </Card>
-
-              {/* History */}
-              <Card>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 800 }}>History</div>
-                    <Hint style={{ marginTop: 6 }}>Your latest 10 duels (creator or joiner).</Hint>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
-                  {!connected ? (
-                    <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>Connect a wallet to see history.</div>
-                  ) : historyUnique.length === 0 ? (
-                    <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>No duels yet.</div>
-                  ) : (
-                    historyUnique.map((r) => {
-                      const didWin =
-                        r.phase === "finished" &&
-                        !!r.winner &&
-                        ((r.winner === "A" && r.createdBy === me) || (r.winner === "B" && r.joinedBy === me));
-
-                      const badge = r.phase !== "finished" ? "open" : didWin ? "win" : "loss";
-                      const tone = badge === "win" ? "green" : badge === "loss" ? "purple" : "neutral";
-
-                      return (
-                        <div
-                          key={r.duelId}
-                          onClick={() => setDuel(r)}
-                          className="glass"
-                          style={{
-                            borderRadius: 16,
-                            padding: 12,
-                            cursor: "pointer",
-                            border: "1px solid rgba(255,255,255,0.10)",
-                            background: "rgba(255,255,255,0.05)",
-                          }}
-                          title="Click to open"
-                        >
-                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                            <div style={{ minWidth: 0 }}>
-                              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                                <div style={{ fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
-                                <Pill label={badge} tone={tone as any} />
-                                <Hint>
-                                  duel{" "}
-                                  <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
-                                    {r.duelId}
-                                  </span>
-                                </Hint>
-                              </div>
-
-                              <div style={{ marginTop: 6, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                                A {short(r.createdBy)} · B {r.joinedBy ? short(r.joinedBy) : "—"}
-                              </div>
-                            </div>
-
-                            <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)", whiteSpace: "nowrap" }}>
-                              {new Date(r.updatedAt).toLocaleString()}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
                 </div>
               </Card>
             </div>
@@ -824,57 +732,54 @@ export default function Page() {
                 {openDuels.length === 0 ? (
                   <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>No open duels.</div>
                 ) : (
-                  openDuels.map((r) => {
-                    const reserved = !!r.joinedBy;
-                    return (
-                      <div
-                        key={r.duelId}
-                        className="glass"
-                        style={{
-                          borderRadius: 18,
-                          padding: 14,
-                          border: "1px solid rgba(255,255,255,0.10)",
-                          background: "rgba(255,255,255,0.05)",
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                              <div style={{ fontSize: 18, fontWeight: 800 }}>
-                                {solFromLamports(r.stakeLamports).toFixed(2)} SOL
-                              </div>
-                              <Pill label={reserved ? "reserved" : "open"} tone={reserved ? "purple" : "green"} />
+                  openDuels.map((r) => (
+                    <div
+                      key={r.duelId}
+                      className="glass"
+                      style={{
+                        borderRadius: 18,
+                        padding: 14,
+                        border: "1px solid rgba(255,255,255,0.10)",
+                        background: "rgba(255,255,255,0.05)",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                            <div style={{ fontSize: 18, fontWeight: 800 }}>
+                              {solFromLamports(r.stakeLamports).toFixed(2)} SOL
                             </div>
-
-                            <div style={{ marginTop: 8, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                              Duel ID{" "}
-                              <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
-                                {r.duelId}
-                              </span>
-                            </div>
-
-                            <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
-                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                                <Label style={{ minWidth: 56 }}>Creator</Label>
-                                <Mono style={{ color: "rgba(231,234,242,0.9)" }}>{short(r.createdBy)}</Mono>
-                              </div>
-                            </div>
+                            <Pill label={r.joinedBy ? "reserved" : "open"} tone={r.joinedBy ? "purple" : "green"} />
                           </div>
 
-                          <div style={{ display: "flex", gap: 10 }}>
-                            <Button
-                              variant="primary"
-                              disabled={!connected || loading === "join" || r.createdBy === me}
-                              onClick={() => joinDuelPaid(r.duelId)}
-                              style={{ minWidth: 120 }}
-                            >
-                              {loading === "join" ? "Joining…" : "Join"}
-                            </Button>
+                          <div style={{ marginTop: 8, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                            Duel ID{" "}
+                            <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
+                              {r.duelId}
+                            </span>
+                          </div>
+
+                          <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                              <Label style={{ minWidth: 56 }}>Creator</Label>
+                              <Mono style={{ color: "rgba(231,234,242,0.9)" }}>{short(r.createdBy)}</Mono>
+                            </div>
                           </div>
                         </div>
+
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <Button
+                            variant="primary"
+                            disabled={!connected || loading === "join" || r.createdBy === me}
+                            onClick={() => joinDuelPaid(r.duelId)}
+                            style={{ minWidth: 120 }}
+                          >
+                            {loading === "join" ? "Joining…" : "Join"}
+                          </Button>
+                        </div>
                       </div>
-                    );
-                  })
+                    </div>
+                  ))
                 )}
               </div>
             </Card>
@@ -891,7 +796,7 @@ export default function Page() {
                   <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                     <Pill
                       label={`phase: ${displayPhase}`}
-                      tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : "neutral"}
+                      tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : displayPhase === "countdown" ? "purple" : "neutral"}
                     />
                     {duel.phase === "finished" ? (
                       <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
@@ -914,10 +819,6 @@ export default function Page() {
                     )}
                   </div>
 
-                  <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
-                    Your role: <b>{myRole ?? "not in this duel"}</b>
-                  </div>
-
                   {duel.phase === "lobby" && duel.joinedBy ? (
                     <div style={{ marginTop: 10, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>
                       Ready: A {duel.readyA ? "✅" : "⏳"} · B {duel.readyB ? "✅" : "⏳"}
@@ -927,7 +828,6 @@ export default function Page() {
                 </div>
 
                 <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  {/* ✅ Copy code removed */}
                   <Button variant="ghost" onClick={reset} style={{ opacity: 0.9 }}>
                     Back to lobby
                   </Button>
@@ -944,7 +844,13 @@ export default function Page() {
                   >
                     {iAmReady ? "READY ✅" : loading === "ready" ? "Setting…" : "READY"}
                   </Button>
-                  <Hint>{bothReady ? "Both ready → starting…" : "Start happens when both ready OR after 30 seconds."}</Hint>
+                  <Hint>
+                    {bothReady
+                      ? "Both ready → starting…"
+                      : readyCountdown != null
+                      ? `Auto-start in ${readyCountdown}s (or when both ready).`
+                      : "Start happens when both ready OR after 30 seconds."}
+                  </Hint>
                 </div>
               ) : null}
 
@@ -968,12 +874,16 @@ export default function Page() {
                   userSelect: "none",
                   WebkitUserSelect: "none",
                   touchAction: "manipulation",
-                  cursor: duel.goAt && duel.phase !== "finished" ? "pointer" : "default",
+                  cursor: displayPhase === "go" ? "pointer" : "default",
                 }}
               >
                 {duel.phase === "lobby" ? (
                   <div style={{ textAlign: "center", color: "rgba(231,234,242,0.80)" }}>
-                    {!duel.joinedBy ? "Waiting for Player B…" : "Ready up! Duel auto-starts when both are ready or after 30 seconds."}
+                    {!duel.joinedBy
+                      ? "Waiting for Player B…"
+                      : bothReady
+                      ? "Starting… (waiting for server timestamps)"
+                      : `Ready up! Auto-start in ${readyCountdown ?? "—"}s.`}
                   </div>
                 ) : displayPhase === "countdown" ? (
                   <div style={{ textAlign: "center" }}>
@@ -1013,7 +923,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Countdown is always 3 seconds (3-2-1). Then a random delay. Early click = instant loss. Auto payout after finish.
+                Lobby: auto-start at 30s (readyDeadlineAt). Start: 3-2-1 (revealAt), then random delay (goAt), then GO.
               </div>
             </Card>
           </div>
