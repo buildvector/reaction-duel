@@ -15,8 +15,8 @@ export type Duel = {
 
   phase: DuelPhase;
 
-  revealAt?: number; // countdown ends here
-  goAt?: number; // green starts here
+  revealAt?: number;
+  goAt?: number;
 
   clickA?: number;
   clickB?: number;
@@ -34,12 +34,10 @@ export type Duel = {
   payoutSig?: string;
   finishedAt?: number;
 
-  // READY ROOM
   readyA?: boolean;
   readyB?: boolean;
   readyDeadlineAt?: number;
 
-  // AUTO-FINISH
   firstClickAt?: number;
   finalizeAt?: number;
 
@@ -61,14 +59,34 @@ function redisEnv(): RedisEnv {
   };
 }
 
+/**
+ * ✅ Upstash "Read Your Writes" sync token
+ * This reduces stale reads from read replicas between subsequent requests
+ * on the same warm serverless instance.
+ *
+ * Docs: https://upstash.com/docs/redis/howto/readyourwrites
+ */
+let _syncToken: string | undefined;
+
 async function redis<T>(command: string, ...args: any[]): Promise<T> {
   const { url, token } = redisEnv();
   const path = `${url}/${command}/${args.map((a) => encodeURIComponent(String(a))).join("/")}`;
 
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+  };
+
+  // ✅ Send RYW token if we have one
+  if (_syncToken) headers["upstash-sync-token"] = _syncToken;
+
   const res = await fetch(path, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers,
     cache: "no-store",
   });
+
+  // ✅ Capture latest RYW token from response (reads and writes both return it)
+  const newToken = res.headers.get("upstash-sync-token");
+  if (newToken) _syncToken = newToken;
 
   const json = await res.json();
   if (!res.ok) throw new Error(json?.error ?? `REDIS_${command}_FAILED`);
@@ -103,12 +121,11 @@ function isFinishedPhase(phase: unknown): phase is "finished" {
 /* ---------------- PHASE / START ---------------- */
 
 function startNow(duel: Duel, t: number) {
-  // fixed 3s countdown, then random delay before green
   const countdownMs = 3000;
   const randomDelay = 900 + Math.floor(Math.random() * 1300);
 
-  duel.revealAt = t + countdownMs; // countdown 3..2..1 until revealAt
-  duel.goAt = duel.revealAt + randomDelay; // random delay until green
+  duel.revealAt = t + countdownMs;
+  duel.goAt = duel.revealAt + randomDelay;
   duel.phase = "countdown";
 
   duel.clickA = undefined;
@@ -149,12 +166,10 @@ function maybeStartFromReadyRoom(duel: Duel, t: number) {
   const bothReady = !!duel.readyA && !!duel.readyB;
   const deadlineHit = t >= (duel.readyDeadlineAt ?? 0);
 
-  if (bothReady || deadlineHit) {
-    startNow(duel, t);
-  }
+  if (bothReady || deadlineHit) startNow(duel, t);
 }
 
-/* ---------------- AUTO-FINISH (stall) ---------------- */
+/* ---------------- AUTO-FINISH ---------------- */
 
 function finalizeIfOverdueInternal(duel: Duel, t: number) {
   if (isFinishedPhase(duel.phase)) return;
@@ -163,13 +178,9 @@ function finalizeIfOverdueInternal(duel: Duel, t: number) {
 
   if (duel.clickA != null && duel.clickB != null) return;
 
-  if (duel.clickA != null && duel.clickB == null) {
-    duel.winner = "A";
-  } else if (duel.clickB != null && duel.clickA == null) {
-    duel.winner = "B";
-  } else {
-    return;
-  }
+  if (duel.clickA != null && duel.clickB == null) duel.winner = "A";
+  else if (duel.clickB != null && duel.clickA == null) duel.winner = "B";
+  else return;
 
   duel.phase = "finished";
   duel.finishedAt = duel.finishedAt ?? t;
@@ -182,16 +193,27 @@ async function saveDuel(duel: Duel) {
   await redis("set", duelKey(duel.duelId), JSON.stringify(duel));
 }
 
-export async function getDuel(id: string): Promise<Duel | null> {
+/**
+ * ✅ "Best effort" read-repair:
+ * If Upstash replica returns stale, the next read *usually* catches up
+ * when using the sync token. We also retry once quickly if needed.
+ */
+async function getDuelRaw(id: string): Promise<Duel | null> {
   const raw = await redis<string | null>("get", duelKey(id));
   if (!raw) return null;
-
-  let duel: Duel;
   try {
-    duel = JSON.parse(raw) as Duel;
+    return JSON.parse(raw) as Duel;
   } catch {
     return null;
   }
+}
+
+export async function getDuel(id: string): Promise<Duel | null> {
+  const duelId = id.toUpperCase();
+
+  // First attempt
+  let duel = await getDuelRaw(duelId);
+  if (!duel) return null;
 
   const t = now();
 
@@ -204,6 +226,11 @@ export async function getDuel(id: string): Promise<Duel | null> {
   } else {
     await saveDuel(duel);
   }
+
+  // Quick second read to reduce “write then immediate stale read” windows
+  // (helps especially right after join/ready)
+  const duel2 = await getDuelRaw(duelId);
+  if (duel2 && duel2.updatedAt >= duel.updatedAt) duel = duel2;
 
   return duel;
 }
@@ -269,7 +296,6 @@ export async function joinDuel(input: { duelId: string; joinedBy: string; paySig
 
   await redis("zrem", OPEN_ZSET, duel.duelId);
 
-  // start ready room timer
   duel.readyA = false;
   duel.readyB = false;
   duel.readyDeadlineAt = now() + 30_000;
@@ -294,15 +320,13 @@ export async function setReady(input: { duelId: string; pubkey: string }): Promi
   const t = now();
   duel.readyDeadlineAt = duel.readyDeadlineAt ?? t + 30_000;
 
-  if (duel.readyA && duel.readyB) {
-    startNow(duel, t);
-  }
+  if (duel.readyA && duel.readyB) startNow(duel, t);
 
   await saveDuel(duel);
   return duel;
 }
 
-/* ---------------- HISTORY (dedupe) ---------------- */
+/* ---------------- HISTORY ---------------- */
 
 async function recordHistoryIfFinished(duel: Duel) {
   if (!isFinishedPhase(duel.phase)) return;
@@ -350,7 +374,6 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
     return duel;
   }
 
-  // early click = loss (before goAt)
   if (input.clickedAt < duel.goAt) {
     if (input.who === "A") duel.falseA = true;
     else duel.falseB = true;
@@ -366,7 +389,6 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
 
   const reactionMs = Math.max(0, input.clickedAt - duel.goAt);
 
-  // anti-bot
   if (reactionMs < 120) {
     if (input.who === "A") duel.falseA = true;
     else duel.falseB = true;
@@ -380,7 +402,6 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
     return duel;
   }
 
-  // record first valid click only
   if (input.who === "A") {
     if (duel.clickA != null) return duel;
     duel.clickA = reactionMs;
@@ -389,7 +410,6 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
     duel.clickB = reactionMs;
   }
 
-  // start 5s auto-finish timer once first player clicks
   if (!duel.firstClickAt) {
     duel.firstClickAt = t;
     duel.finalizeAt = t + 5000;
@@ -405,10 +425,7 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
 
   await saveDuel(duel);
 
-  if (isFinishedPhase(duel.phase)) {
-    await recordHistoryIfFinished(duel);
-  }
-
+  if (isFinishedPhase(duel.phase)) await recordHistoryIfFinished(duel);
   return duel;
 }
 
@@ -438,7 +455,7 @@ export async function getHistory(pubkey: string, limit = 10): Promise<Duel[]> {
   return out;
 }
 
-/* ---------------- PAYOUT FLAG (FIX IMPORT) ---------------- */
+/* ---------------- PAYOUT FLAG ---------------- */
 
 export async function markPayout(input: { duelId: string; payoutSig: string }): Promise<Duel> {
   const duel = await getDuel(input.duelId);

@@ -328,25 +328,12 @@ export default function Page() {
     };
   }, [duelId]);
 
-  // Open duels polling (also stale guard)
+  // Open duels polling
   const refreshOpenDuels = async (quiet = false) => {
     try {
       if (!quiet) setOpenRefreshing(true);
       const { duels } = await getJSON<{ duels: Duel[] }>(`/api/duel/open?limit=25`);
-
-      setOpenDuels((prev) => {
-        const prevMap = new Map(prev.map((d) => [d.duelId, d]));
-        const next: Duel[] = [];
-        for (const d of duels ?? []) {
-          const p = prevMap.get(d.duelId);
-          if (p && typeof p.updatedAt === "number" && typeof d.updatedAt === "number" && d.updatedAt < p.updatedAt) {
-            next.push(p);
-          } else {
-            next.push(d);
-          }
-        }
-        return next;
-      });
+      setOpenDuels(duels ?? []);
     } catch {
     } finally {
       if (!quiet) setOpenRefreshing(false);
@@ -454,7 +441,7 @@ export default function Page() {
         paySigA: sig,
       });
 
-      setDuel(duel);
+      applyFreshDuel(duel);
     } catch (e: any) {
       alert(e?.message ?? "Create failed");
     } finally {
@@ -483,7 +470,7 @@ export default function Page() {
         paySigB: sig,
       });
 
-      setDuel(duel);
+      applyFreshDuel(duel);
     } catch (e: any) {
       alert(e?.message ?? "Join failed");
     } finally {
@@ -511,13 +498,18 @@ export default function Page() {
       setDuel((prev) => {
         if (!prev) return next;
         if (prev.duelId !== next.duelId) return next;
-        const merged = { ...prev, ...next };
+
+        const merged = { ...prev, ...next } as Duel;
+
+        // ensure ready flag sticks immediately
         if (myRole === "A") merged.readyA = true;
         if (myRole === "B") merged.readyB = true;
+
+        // don’t regress updatedAt snapshot
         if (typeof prev.updatedAt === "number" && typeof next.updatedAt === "number" && next.updatedAt < prev.updatedAt) {
-          return merged as Duel; // keep local newer, but apply ready flags
+          return merged;
         }
-        return merged as Duel;
+        return merged;
       });
     } catch (e: any) {
       alert(e?.message ?? "Ready failed");
@@ -705,14 +697,17 @@ export default function Page() {
                       </Button>
                     </div>
                     {customError ? <div style={{ fontSize: 12, color: "#fecaca" }}>{customError}</div> : null}
-                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                      MVP limits: {MIN_BET} – {MAX_BET} SOL.
-                    </div>
+                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>MVP limits: {MIN_BET} – {MAX_BET} SOL.</div>
                   </div>
                 </div>
 
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
+                  <Button
+                    variant="primary"
+                    onClick={createDuelPaid}
+                    disabled={!connected || !publicKey || loading === "create"}
+                    style={{ minWidth: 170 }}
+                  >
                     {loading === "create" ? "Creating…" : "Create & deposit"}
                   </Button>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
@@ -800,7 +795,15 @@ export default function Page() {
                   <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                     <Pill
                       label={`phase: ${displayPhase}`}
-                      tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : displayPhase === "countdown" ? "purple" : "neutral"}
+                      tone={
+                        displayPhase === "go"
+                          ? "green"
+                          : displayPhase === "waiting_random"
+                          ? "purple"
+                          : displayPhase === "countdown"
+                          ? "purple"
+                          : "neutral"
+                      }
                     />
                     {duel.phase === "finished" ? (
                       <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
@@ -808,7 +811,8 @@ export default function Page() {
                   </div>
 
                   <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
-                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
+                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Pot:{" "}
+                    <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
                   </div>
 
                   <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
