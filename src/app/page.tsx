@@ -250,6 +250,10 @@ export default function Page() {
   const [openDuels, setOpenDuels] = useState<Duel[]>([]);
   const [openRefreshing, setOpenRefreshing] = useState(false);
 
+  // ✅ History
+  const [history, setHistory] = useState<Duel[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
   const [mounted, setMounted] = useState(false);
 
   // ✅ server-synced clock
@@ -305,14 +309,13 @@ export default function Page() {
 
   // ✅ One-shot re-sync (useful right before GO)
   const syncInFlight = useRef(false);
-  async function hardSync(duelId: string) {
+  async function hardSync(id: string) {
     if (syncInFlight.current) return;
     syncInFlight.current = true;
     try {
       const t0 = performance.now();
-      const { serverNow } = await getJSON<{ duel: Duel; serverNow: number }>(`/api/duel/get?duelId=${encodeURIComponent(duelId)}`);
+      const { serverNow } = await getJSON<{ duel: Duel; serverNow: number }>(`/api/duel/get?duelId=${encodeURIComponent(id)}`);
       const t1 = performance.now();
-      // rough RTT compensation (half)
       const rtt = Math.max(0, t1 - t0);
       applyServerNow(serverNow + rtt / 2, { aggressive: true });
     } catch {
@@ -320,6 +323,35 @@ export default function Page() {
       syncInFlight.current = false;
     }
   }
+
+  // ✅ History loader (requires /api/duel/history route)
+  async function refreshHistory(quiet = false) {
+    if (!connected || !publicKey) return;
+    try {
+      if (!quiet) setHistoryLoading(true);
+      const { duels } = await getJSON<{ duels: Duel[] }>(`/api/duel/history?pubkey=${encodeURIComponent(me)}`);
+      setHistory(duels ?? []);
+    } catch {
+    } finally {
+      if (!quiet) setHistoryLoading(false);
+    }
+  }
+
+  // auto-refresh history
+  useEffect(() => {
+    if (!connected || !publicKey) return;
+    refreshHistory(true);
+    const i = setInterval(() => refreshHistory(true), 4000);
+    return () => clearInterval(i);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, publicKey, me]);
+
+  // refresh history when duel finishes / payout updates
+  useEffect(() => {
+    if (!duel) return;
+    if (duel.phase === "finished") refreshHistory(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duel?.phase, duel?.payoutSig, duel?.duelId]);
 
   // Poll active duel (adaptive interval near GO)
   useEffect(() => {
@@ -345,7 +377,6 @@ export default function Page() {
 
     tick();
 
-    // adaptive interval: faster when close to GO so phase flips are crisp on both browsers
     const intervalMs = (() => {
       const t = uiNow();
       const goSoon = duel?.goAt ? duel.goAt - t < 5000 : false;
@@ -477,6 +508,7 @@ export default function Page() {
       });
 
       applyFreshDuel(duel);
+      refreshHistory(true);
     } catch (e: any) {
       alert(e?.message ?? "Create failed");
     } finally {
@@ -509,6 +541,8 @@ export default function Page() {
 
       // ✅ immediately hard-sync clock after join (Edge/Chrome drift fix)
       await hardSync(code);
+
+      refreshHistory(true);
     } catch (e: any) {
       alert(e?.message ?? "Join failed");
     } finally {
@@ -618,6 +652,7 @@ export default function Page() {
         clickedAt: uiNow(),
       });
       applyFreshDuel(next);
+      if (next.phase === "finished") refreshHistory(true);
     } catch (e: any) {
       clickedLocalRef.current = false;
       alert(e?.message ?? "Click failed");
@@ -711,139 +746,205 @@ export default function Page() {
         </div>
 
         {!duel ? (
-          <div style={{ marginTop: 26, display: "grid", gap: 16, gridTemplateColumns: "1fr 1fr" }}>
-            <div style={{ display: "grid", gap: 16 }}>
-              <Card>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div>
-                    <div style={{ fontSize: 16, fontWeight: 800 }}>Create duel</div>
-                    <Hint style={{ marginTop: 6 }}>Deposit goes to treasury. 3% fee is taken instantly.</Hint>
-                  </div>
-                  <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>min {MIN_BET} SOL</div>
-                </div>
-
-                <div style={{ marginTop: 18, display: "grid", gap: 10 }}>
-                  <Label>Bet size</Label>
-
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>
-                    {BET_OPTIONS_SOL.map((x) => {
-                      const active = stakeSol === x;
-                      return (
-                        <button
-                          key={x}
-                          onClick={() => setStakeSol(x)}
-                          className="ring-violet-hover"
-                          style={{
-                            width: "100%",
-                            borderRadius: 14,
-                            padding: 12,
-                            textAlign: "left",
-                            border: active ? "1px solid rgba(255,255,255,0.28)" : "1px solid rgba(255,255,255,0.10)",
-                            background: active ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.05)",
-                            color: active ? "#0b0d12" : "var(--text)",
-                            boxShadow: active ? "0 12px 50px rgba(0,0,0,0.45)" : undefined,
-                            cursor: "pointer",
-                          }}
-                        >
-                          <div style={{ fontSize: 14, fontWeight: 800 }}>{x} SOL</div>
-                          <div style={{ fontSize: 12, opacity: active ? 0.7 : 0.65 }}>{active ? "Selected" : "Click to select"}</div>
-                        </button>
-                      );
-                    })}
+          <>
+            <div style={{ marginTop: 26, display: "grid", gap: 16, gridTemplateColumns: "1fr 1fr" }}>
+              <div style={{ display: "grid", gap: 16 }}>
+                <Card>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 16, fontWeight: 800 }}>Create duel</div>
+                      <Hint style={{ marginTop: 6 }}>Deposit goes to treasury. 3% fee is taken instantly.</Hint>
+                    </div>
+                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>min {MIN_BET} SOL</div>
                   </div>
 
-                  <div style={{ marginTop: 4, display: "grid", gap: 8 }}>
-                    <Label>Custom bet (SOL)</Label>
-                    <div style={{ display: "flex", gap: 10 }}>
-                      <Input value={custom} onChange={(e) => setCustom((e.target as any).value)} placeholder="e.g. 0.35" />
-                      <Button variant="ghost" onClick={applyCustom} disabled={!!customError || parsedCustom === null}>
-                        Apply
+                  <div style={{ marginTop: 18, display: "grid", gap: 10 }}>
+                    <Label>Bet size</Label>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10 }}>
+                      {BET_OPTIONS_SOL.map((x) => {
+                        const active = stakeSol === x;
+                        return (
+                          <button
+                            key={x}
+                            onClick={() => setStakeSol(x)}
+                            className="ring-violet-hover"
+                            style={{
+                              width: "100%",
+                              borderRadius: 14,
+                              padding: 12,
+                              textAlign: "left",
+                              border: active ? "1px solid rgba(255,255,255,0.28)" : "1px solid rgba(255,255,255,0.10)",
+                              background: active ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.05)",
+                              color: active ? "#0b0d12" : "var(--text)",
+                              boxShadow: active ? "0 12px 50px rgba(0,0,0,0.45)" : undefined,
+                              cursor: "pointer",
+                            }}
+                          >
+                            <div style={{ fontSize: 14, fontWeight: 800 }}>{x} SOL</div>
+                            <div style={{ fontSize: 12, opacity: active ? 0.7 : 0.65 }}>{active ? "Selected" : "Click to select"}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div style={{ marginTop: 4, display: "grid", gap: 8 }}>
+                      <Label>Custom bet (SOL)</Label>
+                      <div style={{ display: "flex", gap: 10 }}>
+                        <Input value={custom} onChange={(e) => setCustom((e.target as any).value)} placeholder="e.g. 0.35" />
+                        <Button variant="ghost" onClick={applyCustom} disabled={!!customError || parsedCustom === null}>
+                          Apply
+                        </Button>
+                      </div>
+                      {customError ? <div style={{ fontSize: 12, color: "#fecaca" }}>{customError}</div> : null}
+                      <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                        MVP limits: {MIN_BET} – {MAX_BET} SOL.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                    <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
+                      {loading === "create" ? "Creating…" : "Create & deposit"}
+                    </Button>
+                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                      {connected ? "You will sign a transfer in Phantom." : "Connect a wallet to play."}
+                    </div>
+                  </div>
+                </Card>
+
+                {connected && publicKey ? (
+                  <Card>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 800 }}>Last 10 games</div>
+                        <Hint style={{ marginTop: 6 }}>Your recent duels.</Hint>
+                      </div>
+                      <Button variant="ghost" onClick={() => refreshHistory(false)} disabled={historyLoading}>
+                        {historyLoading ? "Loading…" : "Refresh"}
                       </Button>
                     </div>
-                    {customError ? <div style={{ fontSize: 12, color: "#fecaca" }}>{customError}</div> : null}
-                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                      MVP limits: {MIN_BET} – {MAX_BET} SOL.
+
+                    <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
+                      {history.length === 0 ? (
+                        <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>No history yet.</div>
+                      ) : (
+                        history.map((h) => {
+                          const role = h.createdBy === me ? "A" : h.joinedBy === me ? "B" : null;
+                          const won = role && h.winner ? h.winner === role : null;
+
+                          return (
+                            <div
+                              key={h.duelId}
+                              className="glass"
+                              style={{
+                                borderRadius: 16,
+                                padding: 12,
+                                border: "1px solid rgba(255,255,255,0.10)",
+                                background: "rgba(255,255,255,0.05)",
+                              }}
+                            >
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
+                                  <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                                    <div style={{ fontSize: 14, fontWeight: 900 }}>{solFromLamports(h.stakeLamports).toFixed(2)} SOL</div>
+                                    <Pill label={h.phase === "finished" ? (won == null ? "done" : won ? "win" : "lose") : `phase: ${h.phase}`} tone={won == null ? "neutral" : won ? "green" : "red"} />
+                                    <span className="mono" style={{ opacity: 0.8 }}>
+                                      {h.duelId}
+                                    </span>
+                                  </div>
+
+                                  <div style={{ fontSize: 12, color: "rgba(231,234,242,0.65)" }}>
+                                    A {h.clickA ?? "—"} ms · B {h.clickB ?? "—"} ms
+                                  </div>
+                                </div>
+
+                                <Button
+                                  variant="ghost"
+                                  onClick={async () => {
+                                    const { duel: fresh } = await getJSON<{ duel: Duel }>(`/api/duel/get?duelId=${encodeURIComponent(h.duelId)}`);
+                                    setDuel(fresh);
+                                  }}
+                                >
+                                  View
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
+                  </Card>
+                ) : null}
+              </div>
+
+              <Card>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 800 }}>Open duels</div>
+                    <Hint style={{ marginTop: 6 }}>Join an open duel. Deposit goes to treasury.</Hint>
                   </div>
+
+                  <Button variant="ghost" onClick={() => refreshOpenDuels(false)} disabled={openRefreshing}>
+                    {openRefreshing ? "Refreshing…" : "Refresh"}
+                  </Button>
                 </div>
 
-                <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
-                    {loading === "create" ? "Creating…" : "Create & deposit"}
-                  </Button>
-                  <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                    {connected ? "You will sign a transfer in Phantom." : "Connect a wallet to play."}
-                  </div>
+                <div style={{ marginTop: 14, display: "grid", gap: 12 }}>
+                  {openDuels.length === 0 ? (
+                    <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>No open duels.</div>
+                  ) : (
+                    openDuels.map((r) => (
+                      <div
+                        key={r.duelId}
+                        className="glass"
+                        style={{
+                          borderRadius: 18,
+                          padding: 14,
+                          border: "1px solid rgba(255,255,255,0.10)",
+                          background: "rgba(255,255,255,0.05)",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                              <div style={{ fontSize: 18, fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
+                              <Pill label={r.joinedBy ? "reserved" : "open"} tone={r.joinedBy ? "purple" : "green"} />
+                            </div>
+
+                            <div style={{ marginTop: 8, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                              Duel ID{" "}
+                              <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
+                                {r.duelId}
+                              </span>
+                            </div>
+
+                            <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <Label style={{ minWidth: 56 }}>Creator</Label>
+                                <Mono style={{ color: "rgba(231,234,242,0.9)" }}>{short(r.createdBy)}</Mono>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div style={{ display: "flex", gap: 10 }}>
+                            <Button
+                              variant="primary"
+                              disabled={!connected || !publicKey || loading === "join" || r.createdBy === me}
+                              onClick={() => joinDuelPaid(r.duelId)}
+                              style={{ minWidth: 120 }}
+                            >
+                              {loading === "join" ? "Joining…" : "Join"}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
                 </div>
               </Card>
             </div>
-
-            <Card>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 800 }}>Open duels</div>
-                  <Hint style={{ marginTop: 6 }}>Join an open duel. Deposit goes to treasury.</Hint>
-                </div>
-
-                <Button variant="ghost" onClick={() => refreshOpenDuels(false)} disabled={openRefreshing}>
-                  {openRefreshing ? "Refreshing…" : "Refresh"}
-                </Button>
-              </div>
-
-              <div style={{ marginTop: 14, display: "grid", gap: 12 }}>
-                {openDuels.length === 0 ? (
-                  <div style={{ fontSize: 13, color: "rgba(231,234,242,0.55)" }}>No open duels.</div>
-                ) : (
-                  openDuels.map((r) => (
-                    <div
-                      key={r.duelId}
-                      className="glass"
-                      style={{
-                        borderRadius: 18,
-                        padding: 14,
-                        border: "1px solid rgba(255,255,255,0.10)",
-                        background: "rgba(255,255,255,0.05)",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                            <div style={{ fontSize: 18, fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
-                            <Pill label={r.joinedBy ? "reserved" : "open"} tone={r.joinedBy ? "purple" : "green"} />
-                          </div>
-
-                          <div style={{ marginTop: 8, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                            Duel ID{" "}
-                            <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
-                              {r.duelId}
-                            </span>
-                          </div>
-
-                          <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                              <Label style={{ minWidth: 56 }}>Creator</Label>
-                              <Mono style={{ color: "rgba(231,234,242,0.9)" }}>{short(r.createdBy)}</Mono>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div style={{ display: "flex", gap: 10 }}>
-                          <Button
-                            variant="primary"
-                            disabled={!connected || !publicKey || loading === "join" || r.createdBy === me}
-                            onClick={() => joinDuelPaid(r.duelId)}
-                            style={{ minWidth: 120 }}
-                          >
-                            {loading === "join" ? "Joining…" : "Join"}
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </Card>
-          </div>
+          </>
         ) : (
           <div style={{ marginTop: 26 }}>
             <Card>
@@ -869,9 +970,7 @@ export default function Page() {
                     {duel.phase === "finished" ? (
                       <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
                     ) : null}
-                    {finishCountdown != null && duel.phase !== "finished" ? (
-                      <Pill label={`auto-finish: ${finishCountdown}s`} tone="purple" />
-                    ) : null}
+                    {finishCountdown != null && duel.phase !== "finished" ? <Pill label={`auto-finish: ${finishCountdown}s`} tone="purple" /> : null}
                   </div>
 
                   <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
@@ -923,7 +1022,7 @@ export default function Page() {
                   e.preventDefault();
                   clickDuel();
                 }}
-                onClick={() => clickDuel()} // ✅ fallback for browsers that don’t like pointerdown timing
+                onClick={() => clickDuel()} // ✅ fallback
                 style={{
                   marginTop: 16,
                   height: 280,
@@ -958,9 +1057,7 @@ export default function Page() {
                     <div style={{ marginTop: 10, color: "rgba(231,234,242,0.85)" }}>
                       A: <b>{duel.clickA ?? "—"}</b> ms &nbsp; | &nbsp; B: <b>{duel.clickB ?? "—"}</b> ms
                     </div>
-                    <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>
-                      {duel.payoutSig ? "Payout sent ✅" : "Paying out…"}
-                    </div>
+                    <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>{duel.payoutSig ? "Payout sent ✅" : "Paying out…"}</div>
                   </div>
                 ) : (
                   <div style={{ textAlign: "center" }}>
@@ -973,7 +1070,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Added: aggressive clock sync near GO + click fallback + visible 5s auto-finish countdown.
+                Added: aggressive clock sync near GO + click fallback + visible 5s auto-finish countdown + history panel in lobby.
               </div>
             </Card>
           </div>
