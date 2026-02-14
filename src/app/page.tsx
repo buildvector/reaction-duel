@@ -62,9 +62,16 @@ function short(pk?: string) {
   if (!pk) return "—";
   return `${pk.slice(0, 4)}…${pk.slice(-4)}`;
 }
+
+/**
+ * ✅ Make IDs effectively collision-proof (timestamp + random).
+ */
 function makeDuelId() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
+  const a = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const b = Date.now().toString(36).slice(-4).toUpperCase();
+  return `${a}${b}`; // e.g. "K9QX2F8D"
 }
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -80,9 +87,6 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
   return j as T;
 }
 
-/**
- * IMPORTANT: no-store + cache-bust to avoid stale duel state.
- */
 async function getJSON<T>(url: string): Promise<T> {
   const u = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
   u.searchParams.set("_ts", String(Date.now()));
@@ -90,10 +94,7 @@ async function getJSON<T>(url: string): Promise<T> {
   const r = await fetch(u.toString(), {
     method: "GET",
     cache: "no-store",
-    headers: {
-      "Cache-Control": "no-store",
-      Pragma: "no-cache",
-    },
+    headers: { "Cache-Control": "no-store", Pragma: "no-cache" },
   });
 
   const j = await r.json();
@@ -277,15 +278,9 @@ export default function Page() {
 
   const [mounted, setMounted] = useState(false);
 
-  /**
-   * ✅ Stable "server-synced" clock:
-   * uiNow = Date.now() + offset
-   * offset is smoothed when we receive serverNow, so timers don't jump backwards/forwards.
-   */
+  // stable time: uiNow = Date.now() + offset
   const offsetRef = useRef<number | null>(null);
-  const lastServerNowRef = useRef<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(Date.now());
-
   const uiNow = () => Date.now() + (offsetRef.current ?? 0);
 
   useEffect(() => {
@@ -293,7 +288,6 @@ export default function Page() {
     setNowMs(Date.now());
   }, []);
 
-  // 20Hz UI clock tick (smooth, monotonic-ish)
   useEffect(() => {
     if (!mounted) return;
     const i = setInterval(() => setNowMs(uiNow()), 50);
@@ -323,21 +317,15 @@ export default function Page() {
 
         setDuel(fresh);
 
-        // ✅ update offset smoothly (never snap UI time)
         if (typeof serverNow === "number") {
-          lastServerNowRef.current = serverNow;
           const targetOffset = serverNow - Date.now();
 
           if (offsetRef.current == null) {
             offsetRef.current = targetOffset;
           } else {
-            // Smooth towards target. (0.15 = fairly responsive but stable)
             const alpha = 0.15;
-
-            // Prevent insane jumps (cold start / very delayed response)
-            const clamp = 2000; // ms
+            const clamp = 2000;
             const delta = Math.max(-clamp, Math.min(clamp, targetOffset - offsetRef.current));
-
             offsetRef.current = offsetRef.current + delta * alpha;
           }
         }
@@ -345,7 +333,7 @@ export default function Page() {
     };
 
     tick();
-    const i = setInterval(tick, 500); // slower poll reduces noise; UI still updates at 50ms
+    const i = setInterval(tick, 500);
     return () => {
       alive = false;
       clearInterval(i);
@@ -522,6 +510,35 @@ export default function Page() {
     }
   }
 
+  const clickedLocalRef = useRef(false);
+  useEffect(() => {
+    clickedLocalRef.current = false;
+  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
+
+  // Derived phase
+  const displayPhase: DuelPhase = useMemo(() => {
+    if (!duel) return "lobby";
+    if (duel.phase === "finished") return "finished";
+
+    const t = nowMs || Date.now();
+    if (duel.revealAt && duel.goAt) {
+      if (t < duel.revealAt) return "countdown";
+      if (t < duel.goAt) return "waiting_random";
+      return "go";
+    }
+
+    if (duel.phase !== "lobby") return duel.phase;
+    return "lobby";
+  }, [duel, nowMs]);
+
+  // ✅ Grace window so first click at the transition counts
+  function isGoOrJustBecameGo() {
+    if (!duel?.goAt) return displayPhase === "go";
+    const t = nowMs || Date.now();
+    const GRACE_MS = 160; // allow click slightly before UI flips
+    return t >= duel.goAt - GRACE_MS;
+  }
+
   async function clickDuel() {
     if (!duel) return;
     if (!myRole) {
@@ -530,7 +547,8 @@ export default function Page() {
     }
     if (duel.phase === "finished") return;
 
-    if (displayPhase !== "go") return;
+    // ✅ allow click if GO or within grace window
+    if (!isGoOrJustBecameGo()) return;
 
     if (clickedLocalRef.current) return;
     clickedLocalRef.current = true;
@@ -552,32 +570,11 @@ export default function Page() {
     setDuel(null);
   }
 
-  const clickedLocalRef = useRef(false);
-  useEffect(() => {
-    clickedLocalRef.current = false;
-  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
-
   const feeLamports = duel ? Math.floor((duel.stakeLamports * duel.feeBps) / 10_000) : 0;
   const netLamports = duel ? Math.max(0, duel.stakeLamports - feeLamports) : 0;
   const potLamports = duel ? netLamports * 2 : 0;
 
   const feePct = "3";
-
-  const displayPhase: DuelPhase = useMemo(() => {
-    if (!duel) return "lobby";
-    if (duel.phase === "finished") return "finished";
-
-    const t = nowMs || Date.now();
-
-    if (duel.revealAt && duel.goAt) {
-      if (t < duel.revealAt) return "countdown";
-      if (t < duel.goAt) return "waiting_random";
-      return "go";
-    }
-
-    if (duel.phase !== "lobby") return duel.phase;
-    return "lobby";
-  }, [duel, nowMs]);
 
   const countdownText = useMemo(() => {
     if (!mounted) return "";
@@ -620,6 +617,12 @@ export default function Page() {
 
   const iAmReady = myRole === "A" ? !!duel?.readyA : myRole === "B" ? !!duel?.readyB : false;
   const bothReady = !!duel?.readyA && !!duel?.readyB;
+
+  // ✅ winner text
+  const iWon = useMemo(() => {
+    if (!duel || duel.phase !== "finished" || !duel.winner || !myRole) return null;
+    return duel.winner === myRole;
+  }, [duel, myRole]);
 
   const bg =
     displayPhase === "go"
@@ -794,9 +797,17 @@ export default function Page() {
                       label={`phase: ${displayPhase}`}
                       tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : displayPhase === "countdown" ? "purple" : "neutral"}
                     />
+                    {duel.phase === "finished" ? (
+                      <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
+                    ) : null}
                   </div>
 
-                  <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
+                  <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
+                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Fee:{" "}
+                    <b>{solFromLamports(feeLamports).toFixed(4)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
+                  </div>
+
+                  <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
                     A: <span className="mono">{short(duel.createdBy)}</span>{" "}
                     {duel.joinedBy ? (
                       <>
@@ -842,12 +853,9 @@ export default function Page() {
                 </div>
               ) : null}
 
+              {/* ✅ IMPORTANT: only pointerdown (no onClick) so we don't double-fire */}
               <div
                 onPointerDown={(e) => {
-                  e.preventDefault();
-                  clickDuel();
-                }}
-                onClick={(e) => {
                   e.preventDefault();
                   clickDuel();
                 }}
@@ -862,7 +870,7 @@ export default function Page() {
                   userSelect: "none",
                   WebkitUserSelect: "none",
                   touchAction: "manipulation",
-                  cursor: displayPhase === "go" ? "pointer" : "default",
+                  cursor: isGoOrJustBecameGo() && duel.phase !== "finished" ? "pointer" : "default",
                 }}
               >
                 {duel.phase === "lobby" ? (
@@ -882,11 +890,28 @@ export default function Page() {
                 ) : duel.phase === "finished" ? (
                   <div style={{ textAlign: "center" }}>
                     <div style={{ fontSize: 18, fontWeight: 900 }}>Result</div>
+
+                    {/* ✅ WIN/LOSE headline */}
+                    <div style={{ marginTop: 10, fontSize: 44, fontWeight: 950 }}>
+                      {iWon == null ? "DONE" : iWon ? "YOU WIN" : "YOU LOSE"}
+                    </div>
+
                     <div style={{ marginTop: 10, color: "rgba(231,234,242,0.85)" }}>
                       A: <b>{duel.clickA ?? "—"}</b> ms &nbsp; | &nbsp; B: <b>{duel.clickB ?? "—"}</b> ms
                     </div>
-                    <div style={{ marginTop: 10, fontSize: 20 }}>
+
+                    <div style={{ marginTop: 10, fontSize: 16, color: "rgba(231,234,242,0.70)" }}>
                       Winner: <b>{duel.winner ?? "—"}</b>
+                    </div>
+
+                    <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>
+                      {duel.payoutSig ? "Payout sent ✅" : "Paying out…"}
+                    </div>
+
+                    <div style={{ marginTop: 14, display: "flex", justifyContent: "center" }}>
+                      <Button variant="primary" onClick={reset} style={{ minWidth: 190 }}>
+                        Back to lobby
+                      </Button>
                     </div>
                   </div>
                 ) : (
