@@ -277,22 +277,51 @@ export default function Page() {
     return null;
   }, [duel, connected, publicKey, me]);
 
-  // ✅ IMPORTANT: never regress duel state (stale reads guard)
+  // ✅ Never regress duel state (stale reads guard)
   function applyFreshDuel(fresh: Duel) {
     setDuel((prev) => {
       if (!prev) return fresh;
       if (prev.duelId !== fresh.duelId) return fresh;
-
-      // If server returned older snapshot, ignore it
       if (typeof prev.updatedAt === "number" && typeof fresh.updatedAt === "number" && fresh.updatedAt < prev.updatedAt) {
         return prev;
       }
-
       return fresh;
     });
   }
 
-  // Poll active duel
+  // ✅ Apply serverNow -> offset (faster + adaptive, reduces “green click rejected”)
+  function applyServerNow(serverNow: number, opts?: { aggressive?: boolean }) {
+    const targetOffset = serverNow - Date.now();
+    if (offsetRef.current == null) {
+      offsetRef.current = targetOffset;
+      return;
+    }
+    const aggressive = !!opts?.aggressive;
+    const alpha = aggressive ? 0.45 : 0.25;
+    const clamp = 5000;
+    const delta = Math.max(-clamp, Math.min(clamp, targetOffset - offsetRef.current));
+    offsetRef.current = offsetRef.current + delta * alpha;
+  }
+
+  // ✅ One-shot re-sync (useful right before GO)
+  const syncInFlight = useRef(false);
+  async function hardSync(duelId: string) {
+    if (syncInFlight.current) return;
+    syncInFlight.current = true;
+    try {
+      const t0 = performance.now();
+      const { serverNow } = await getJSON<{ duel: Duel; serverNow: number }>(`/api/duel/get?duelId=${encodeURIComponent(duelId)}`);
+      const t1 = performance.now();
+      // rough RTT compensation (half)
+      const rtt = Math.max(0, t1 - t0);
+      applyServerNow(serverNow + rtt / 2, { aggressive: true });
+    } catch {
+    } finally {
+      syncInFlight.current = false;
+    }
+  }
+
+  // Poll active duel (adaptive interval near GO)
   useEffect(() => {
     if (!duelId) return;
     let alive = true;
@@ -307,26 +336,32 @@ export default function Page() {
         applyFreshDuel(fresh);
 
         if (typeof serverNow === "number") {
-          const targetOffset = serverNow - Date.now();
-          if (offsetRef.current == null) {
-            offsetRef.current = targetOffset;
-          } else {
-            const alpha = 0.15;
-            const clamp = 2000;
-            const delta = Math.max(-clamp, Math.min(clamp, targetOffset - offsetRef.current));
-            offsetRef.current = offsetRef.current + delta * alpha;
-          }
+          const t = uiNow();
+          const goSoon = fresh?.goAt ? Math.abs(fresh.goAt - t) < 4000 : false;
+          applyServerNow(serverNow, { aggressive: goSoon });
         }
       } catch {}
     };
 
     tick();
-    const i = setInterval(tick, 500);
+
+    // adaptive interval: faster when close to GO so phase flips are crisp on both browsers
+    const intervalMs = (() => {
+      const t = uiNow();
+      const goSoon = duel?.goAt ? duel.goAt - t < 5000 : false;
+      if (duel?.phase === "waiting_random" || duel?.phase === "countdown" || goSoon) return 200;
+      if (duel?.phase === "go") return 200;
+      return 500;
+    })();
+
+    const i = setInterval(tick, intervalMs);
+
     return () => {
       alive = false;
       clearInterval(i);
     };
-  }, [duelId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duelId, duel?.phase, duel?.goAt]);
 
   // Open duels polling
   const refreshOpenDuels = async (quiet = false) => {
@@ -471,6 +506,9 @@ export default function Page() {
       });
 
       applyFreshDuel(duel);
+
+      // ✅ immediately hard-sync clock after join (Edge/Chrome drift fix)
+      await hardSync(code);
     } catch (e: any) {
       alert(e?.message ?? "Join failed");
     } finally {
@@ -494,23 +532,23 @@ export default function Page() {
         pubkey: me,
       });
 
-      // optimistic merge + stale guard
       setDuel((prev) => {
         if (!prev) return next;
         if (prev.duelId !== next.duelId) return next;
 
         const merged = { ...prev, ...next } as Duel;
 
-        // ensure ready flag sticks immediately
         if (myRole === "A") merged.readyA = true;
         if (myRole === "B") merged.readyB = true;
 
-        // don’t regress updatedAt snapshot
         if (typeof prev.updatedAt === "number" && typeof next.updatedAt === "number" && next.updatedAt < prev.updatedAt) {
           return merged;
         }
         return merged;
       });
+
+      // ✅ hard-sync when ready pressed (just before countdown starts)
+      await hardSync(duel.duelId);
     } catch (e: any) {
       alert(e?.message ?? "Ready failed");
     } finally {
@@ -533,12 +571,26 @@ export default function Page() {
     return "lobby";
   }, [duel, nowMs]);
 
+  // ✅ bigger GO grace to prevent “green click not registered” due to slight skew
   function isGoOrJustBecameGo() {
     if (!duel?.goAt) return displayPhase === "go";
     const t = nowMs || Date.now();
-    const GRACE_MS = 350;
+    const GRACE_MS = 900;
     return t >= duel.goAt - GRACE_MS;
   }
+
+  // ✅ if we are within 2s of GO, hard-sync once (Edge/Chrome consistency)
+  const goSyncDone = useRef<string | null>(null);
+  useEffect(() => {
+    if (!duel?.duelId || !duel.goAt) return;
+    const t = uiNow();
+    const near = duel.goAt - t < 2000 && duel.goAt - t > -2000;
+    if (!near) return;
+    if (goSyncDone.current === duel.duelId) return;
+    goSyncDone.current = duel.duelId;
+    hardSync(duel.duelId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duel?.duelId, duel?.goAt, nowMs]);
 
   // click
   const clickedLocalRef = useRef(false);
@@ -557,6 +609,9 @@ export default function Page() {
     clickedLocalRef.current = true;
 
     try {
+      // ✅ one last tiny hard-sync before sending click (reduces “clickedAt < goAt”)
+      await hardSync(duel.duelId);
+
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/click", {
         duelId: duel.duelId,
         who: myRole,
@@ -595,6 +650,15 @@ export default function Page() {
     const ms = duel.readyDeadlineAt - t;
     return Math.max(0, Math.ceil(ms / 1000));
   }, [duel?.readyDeadlineAt, nowMs]);
+
+  // ✅ show auto-finish countdown (5s after first click)
+  const finishCountdown = useMemo(() => {
+    if (!duel?.finalizeAt) return null;
+    if (duel.phase === "finished") return null;
+    const t = nowMs || Date.now();
+    const ms = duel.finalizeAt - t;
+    return Math.max(0, Math.ceil(ms / 1000));
+  }, [duel?.finalizeAt, duel?.phase, nowMs]);
 
   const parsedCustom = useMemo(() => {
     const n = Number(String(custom).replace(",", "."));
@@ -697,17 +761,14 @@ export default function Page() {
                       </Button>
                     </div>
                     {customError ? <div style={{ fontSize: 12, color: "#fecaca" }}>{customError}</div> : null}
-                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>MVP limits: {MIN_BET} – {MAX_BET} SOL.</div>
+                    <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
+                      MVP limits: {MIN_BET} – {MAX_BET} SOL.
+                    </div>
                   </div>
                 </div>
 
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button
-                    variant="primary"
-                    onClick={createDuelPaid}
-                    disabled={!connected || !publicKey || loading === "create"}
-                    style={{ minWidth: 170 }}
-                  >
+                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
                     {loading === "create" ? "Creating…" : "Create & deposit"}
                   </Button>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
@@ -808,11 +869,13 @@ export default function Page() {
                     {duel.phase === "finished" ? (
                       <Pill label={duel.payoutSig ? "payout: sent" : "payout: pending"} tone={duel.payoutSig ? "green" : "purple"} />
                     ) : null}
+                    {finishCountdown != null && duel.phase !== "finished" ? (
+                      <Pill label={`auto-finish: ${finishCountdown}s`} tone="purple" />
+                    ) : null}
                   </div>
 
                   <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
-                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Pot:{" "}
-                    <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
+                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
                   </div>
 
                   <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
@@ -860,6 +923,7 @@ export default function Page() {
                   e.preventDefault();
                   clickDuel();
                 }}
+                onClick={() => clickDuel()} // ✅ fallback for browsers that don’t like pointerdown timing
                 style={{
                   marginTop: 16,
                   height: 280,
@@ -901,13 +965,15 @@ export default function Page() {
                 ) : (
                   <div style={{ textAlign: "center" }}>
                     <div style={{ fontSize: 54, fontWeight: 900 }}>CLICK NOW!</div>
-                    <div style={{ marginTop: 10, color: "rgba(231,234,242,0.70)" }}>First valid click wins.</div>
+                    <div style={{ marginTop: 10, color: "rgba(231,234,242,0.70)" }}>
+                      {finishCountdown != null ? `Opponent clicked — you have ${finishCountdown}s` : "First valid click wins."}
+                    </div>
                   </div>
                 )}
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                UI ignores stale server snapshots (prevents “join → back to waiting”).
+                Added: aggressive clock sync near GO + click fallback + visible 5s auto-finish countdown.
               </div>
             </Card>
           </div>
