@@ -405,6 +405,34 @@ export default function Page() {
     run();
   }, [duel?.phase, duel?.winner, duel?.payoutSig, duel?.duelId]);
 
+  // ---- NEW: robust confirm for Chrome/WS issues ----
+  async function confirmSigRobust(sig: string) {
+    // 1) Prefer blockhash-based confirmation (more reliable than confirmTransaction(sig))
+    try {
+      const latest = await connection.getLatestBlockhash("confirmed");
+      await connection.confirmTransaction(
+        { signature: sig, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
+        "confirmed"
+      );
+      return true;
+    } catch {}
+
+    // 2) Fallback polling (no websockets)
+    for (let i = 0; i < 30; i++) {
+      try {
+        const st = await connection.getSignatureStatuses([sig]);
+        const s = st?.value?.[0];
+        if (s?.confirmationStatus === "confirmed" || s?.confirmationStatus === "finalized") return true;
+        if (s?.err) throw new Error("TX_FAILED");
+      } catch (e) {
+        // if it explicitly failed, bubble up
+        if ((e as any)?.message === "TX_FAILED") throw e;
+      }
+      await sleep(2000);
+    }
+    return false;
+  }
+
   async function transferStakeToTreasury(lamports: number) {
     if (!publicKey) throw new Error("WALLET_NOT_READY");
     const treasury = new PublicKey(await getTreasuryPubkey());
@@ -418,7 +446,13 @@ export default function Page() {
     );
 
     const sig = await sendTransaction(tx, connection, { skipPreflight: false });
-    await connection.confirmTransaction(sig, "confirmed");
+
+    // Robust confirm: if it times out, continue anyway (prevents "SOL sent but duel not created")
+    const ok = await confirmSigRobust(sig);
+    if (!ok) {
+      console.warn("TX not confirmed in time (continuing anyway):", sig);
+    }
+
     return sig;
   }
 
