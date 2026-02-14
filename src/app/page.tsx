@@ -136,11 +136,11 @@ function Pill(props: { label: string; tone?: "neutral" | "purple" | "green" | "r
   const tone = props.tone ?? "neutral";
   const shadow =
     tone === "purple"
-      ? "0 0 40px rgba(168,85,247,0.12)"
+      ? "0 0 40px rgba(168, 85, 247, 0.12)"
       : tone === "green"
-      ? "0 0 40px rgba(34,197,94,0.10)"
+      ? "0 0 40px rgba(34, 197, 94, 0.10)"
       : tone === "red"
-      ? "0 0 40px rgba(239,68,68,0.10)"
+      ? "0 0 40px rgba(239, 68, 68, 0.10)"
       : "none";
 
   return (
@@ -562,25 +562,39 @@ export default function Page() {
     }
   }
 
-  // READY
+  // READY (fixed: no double-click, no stale role)
   const readyInFlight = useRef(false);
+  const readyLocalRef = useRef(false);
+
+  useEffect(() => {
+    // allow ready again when new duel or phase changes
+    readyLocalRef.current = false;
+  }, [duelId, duel?.phase]);
+
   async function readyUp() {
     if (!connected || !publicKey || !duel) return;
     if (!me) return;
     if (readyInFlight.current) return;
+    if (readyLocalRef.current) return;
+
+    // compute role from current duel snapshot (not stale closure)
+    const roleNow: "A" | "B" | null = duel.createdBy === me ? "A" : duel.joinedBy === me ? "B" : null;
+    if (!roleNow) return;
+
     readyInFlight.current = true;
-
+    readyLocalRef.current = true;
     setLoading("ready");
-    try {
-      // optimistic UI: set local ready immediately
-      setDuel((prev) => {
-        if (!prev) return prev;
-        const next = { ...prev };
-        if (myRole === "A") next.readyA = true;
-        if (myRole === "B") next.readyB = true;
-        return next;
-      });
 
+    // optimistic UI immediately
+    setDuel((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev } as Duel;
+      if (roleNow === "A") next.readyA = true;
+      if (roleNow === "B") next.readyB = true;
+      return next;
+    });
+
+    try {
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/ready", {
         duelId: duel.duelId,
         pubkey: me,
@@ -589,6 +603,8 @@ export default function Page() {
       applyFreshDuel(next);
       await hardSync(duel.duelId);
     } catch (e: any) {
+      // unlock so user can try again
+      readyLocalRef.current = false;
       alert(e?.message ?? "Ready failed");
     } finally {
       setLoading(null);
@@ -640,7 +656,7 @@ export default function Page() {
     if (clickedLocalRef.current) return;
     clickedLocalRef.current = true;
 
-    const clickedAt = uiNow(); // kept for compatibility
+    const clickedAt = uiNow(); // hint only
 
     try {
       hardSync(duel.duelId);
@@ -728,7 +744,7 @@ export default function Page() {
       : displayPhase === "waiting_random"
       ? "rgba(255, 200, 0, 0.07)"
       : displayPhase === "countdown"
-      ? "rgba(124,58,237,0.10)"
+      ? "rgba(124, 58, 237, 0.10)"
       : "rgba(255,255,255,0.03)";
 
   return (
@@ -845,7 +861,10 @@ export default function Page() {
                                 <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
                                   <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                                     <div style={{ fontSize: 14, fontWeight: 900 }}>{solFromLamports(h.stakeLamports).toFixed(2)} SOL</div>
-                                    <Pill label={h.phase === "finished" ? (won == null ? "done" : won ? "win" : "lose") : `phase: ${h.phase}`} tone={won == null ? "neutral" : won ? "green" : "red"} />
+                                    <Pill
+                                      label={h.phase === "finished" ? (won == null ? "done" : won ? "win" : "lose") : `phase: ${h.phase}`}
+                                      tone={won == null ? "neutral" : won ? "green" : "red"}
+                                    />
                                     <span className="mono" style={{ opacity: 0.8 }}>
                                       {h.duelId}
                                     </span>
@@ -996,7 +1015,15 @@ export default function Page() {
                 <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                   <Button
                     variant="primary"
-                    disabled={!connected || !publicKey || !myRole || loading === "ready" || readyInFlight.current || iAmReady}
+                    disabled={
+                      !connected ||
+                      !publicKey ||
+                      !myRole ||
+                      loading === "ready" ||
+                      readyInFlight.current ||
+                      readyLocalRef.current ||
+                      iAmReady
+                    }
                     onClick={readyUp}
                     style={{ minWidth: 150 }}
                   >
@@ -1059,7 +1086,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Fix: server decides early clicks + UI never regresses join/ready due to stale reads.
+                Fix: server decides early clicks + READY is single-click reliable (Chrome/Edge).
               </div>
             </Card>
           </div>
