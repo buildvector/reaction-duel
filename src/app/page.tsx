@@ -82,7 +82,6 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
   return j as T;
 }
 
-// ✅ GET: force no-store + cache-bust param
 async function getJSON<T>(url: string): Promise<T> {
   const u = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
   u.searchParams.set("_ts", String(Date.now()));
@@ -253,18 +252,16 @@ export default function Page() {
 
   const [mounted, setMounted] = useState(false);
 
-  // ✅ Stable UI clock (no jitter). Server offset is used only for click timestamps.
+  // ✅ server-synced clock
+  const offsetRef = useRef<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(Date.now());
-  const offsetRef = useRef<number>(0);
-  const uiNow = () => Date.now();
-  const serverNowApprox = () => Date.now() + offsetRef.current;
+  const uiNow = () => Date.now() + (offsetRef.current ?? 0);
 
   useEffect(() => {
     setMounted(true);
     setNowMs(Date.now());
   }, []);
 
-  // 20Hz UI clock for smooth timers
   useEffect(() => {
     if (!mounted) return;
     const i = setInterval(() => setNowMs(uiNow()), 50);
@@ -280,7 +277,22 @@ export default function Page() {
     return null;
   }, [duel, connected, publicKey, me]);
 
-  // Poll active duel (also learns server offset)
+  // ✅ IMPORTANT: never regress duel state (stale reads guard)
+  function applyFreshDuel(fresh: Duel) {
+    setDuel((prev) => {
+      if (!prev) return fresh;
+      if (prev.duelId !== fresh.duelId) return fresh;
+
+      // If server returned older snapshot, ignore it
+      if (typeof prev.updatedAt === "number" && typeof fresh.updatedAt === "number" && fresh.updatedAt < prev.updatedAt) {
+        return prev;
+      }
+
+      return fresh;
+    });
+  }
+
+  // Poll active duel
   useEffect(() => {
     if (!duelId) return;
     let alive = true;
@@ -291,15 +303,19 @@ export default function Page() {
           `/api/duel/get?duelId=${encodeURIComponent(duelId)}`
         );
         if (!alive) return;
-        setDuel(fresh);
+
+        applyFreshDuel(fresh);
 
         if (typeof serverNow === "number") {
-          // smooth offset; keep within sane bounds
-          const target = serverNow - Date.now();
-          const clamp = 2000;
-          const bounded = Math.max(-clamp, Math.min(clamp, target));
-          const alpha = 0.2;
-          offsetRef.current = offsetRef.current + (bounded - offsetRef.current) * alpha;
+          const targetOffset = serverNow - Date.now();
+          if (offsetRef.current == null) {
+            offsetRef.current = targetOffset;
+          } else {
+            const alpha = 0.15;
+            const clamp = 2000;
+            const delta = Math.max(-clamp, Math.min(clamp, targetOffset - offsetRef.current));
+            offsetRef.current = offsetRef.current + delta * alpha;
+          }
         }
       } catch {}
     };
@@ -312,11 +328,25 @@ export default function Page() {
     };
   }, [duelId]);
 
+  // Open duels polling (also stale guard)
   const refreshOpenDuels = async (quiet = false) => {
     try {
       if (!quiet) setOpenRefreshing(true);
       const { duels } = await getJSON<{ duels: Duel[] }>(`/api/duel/open?limit=25`);
-      setOpenDuels(duels ?? []);
+
+      setOpenDuels((prev) => {
+        const prevMap = new Map(prev.map((d) => [d.duelId, d]));
+        const next: Duel[] = [];
+        for (const d of duels ?? []) {
+          const p = prevMap.get(d.duelId);
+          if (p && typeof p.updatedAt === "number" && typeof d.updatedAt === "number" && d.updatedAt < p.updatedAt) {
+            next.push(p);
+          } else {
+            next.push(d);
+          }
+        }
+        return next;
+      });
     } catch {
     } finally {
       if (!quiet) setOpenRefreshing(false);
@@ -330,7 +360,8 @@ export default function Page() {
     const tick = async () => {
       try {
         const { duels } = await getJSON<{ duels: Duel[] }>(`/api/duel/open?limit=25`);
-        if (alive) setOpenDuels(duels ?? []);
+        if (!alive) return;
+        setOpenDuels(duels ?? []);
       } catch {}
     };
 
@@ -357,7 +388,7 @@ export default function Page() {
         for (let i = 0; i < 6; i++) {
           const res = await postJSON<{ duel: Duel }>("/api/duel/payout", { duelId: duel.duelId }).catch(() => null);
           if (res?.duel?.payoutSig) {
-            setDuel(res.duel);
+            applyFreshDuel(res.duel);
             break;
           }
           await sleep(800);
@@ -460,7 +491,7 @@ export default function Page() {
     }
   }
 
-  // ✅ READY: lock + optimistic UI (so no double click)
+  // READY
   const readyInFlight = useRef(false);
   async function readyUp() {
     if (!connected || !publicKey || !duel) return;
@@ -476,13 +507,17 @@ export default function Page() {
         pubkey: me,
       });
 
+      // optimistic merge + stale guard
       setDuel((prev) => {
         if (!prev) return next;
         if (prev.duelId !== next.duelId) return next;
-        const merged: Duel = { ...prev, ...next };
+        const merged = { ...prev, ...next };
         if (myRole === "A") merged.readyA = true;
         if (myRole === "B") merged.readyB = true;
-        return merged;
+        if (typeof prev.updatedAt === "number" && typeof next.updatedAt === "number" && next.updatedAt < prev.updatedAt) {
+          return merged as Duel; // keep local newer, but apply ready flags
+        }
+        return merged as Duel;
       });
     } catch (e: any) {
       alert(e?.message ?? "Ready failed");
@@ -496,9 +531,7 @@ export default function Page() {
     if (!duel) return "lobby";
     if (duel.phase === "finished") return "finished";
 
-    // ✅ Use local stable clock for rendering timers (prevents blinking)
     const t = nowMs || Date.now();
-
     if (duel.revealAt && duel.goAt) {
       if (t < duel.revealAt) return "countdown";
       if (t < duel.goAt) return "waiting_random";
@@ -508,15 +541,14 @@ export default function Page() {
     return "lobby";
   }, [duel, nowMs]);
 
-  // ✅ GO grace (so first click on green counts)
-  const isGoOrJustBecameGo = useMemo(() => {
+  function isGoOrJustBecameGo() {
     if (!duel?.goAt) return displayPhase === "go";
     const t = nowMs || Date.now();
     const GRACE_MS = 350;
     return t >= duel.goAt - GRACE_MS;
-  }, [duel?.goAt, displayPhase, nowMs]);
+  }
 
-  // ✅ click: use server-synced timestamp, not local Date.now()
+  // click
   const clickedLocalRef = useRef(false);
   useEffect(() => {
     clickedLocalRef.current = false;
@@ -527,7 +559,7 @@ export default function Page() {
     if (!myRole) return;
     if (duel.phase === "finished") return;
 
-    if (!isGoOrJustBecameGo) return;
+    if (!isGoOrJustBecameGo()) return;
 
     if (clickedLocalRef.current) return;
     clickedLocalRef.current = true;
@@ -536,9 +568,9 @@ export default function Page() {
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/click", {
         duelId: duel.duelId,
         who: myRole,
-        clickedAt: serverNowApprox(), // ✅ IMPORTANT: server-ish timestamp
+        clickedAt: uiNow(),
       });
-      setDuel(next);
+      applyFreshDuel(next);
     } catch (e: any) {
       clickedLocalRef.current = false;
       alert(e?.message ?? "Click failed");
@@ -549,7 +581,9 @@ export default function Page() {
     setDuel(null);
   }
 
-  const potLamports = duel ? Math.max(0, duel.stakeLamports - Math.floor((duel.stakeLamports * duel.feeBps) / 10_000)) * 2 : 0;
+  const feeLamports = duel ? Math.floor((duel.stakeLamports * duel.feeBps) / 10_000) : 0;
+  const netLamports = duel ? Math.max(0, duel.stakeLamports - feeLamports) : 0;
+  const potLamports = duel ? netLamports * 2 : 0;
 
   const countdownText = useMemo(() => {
     if (!mounted) return "";
@@ -678,12 +712,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button
-                    variant="primary"
-                    onClick={createDuelPaid}
-                    disabled={!connected || !publicKey || loading === "create"}
-                    style={{ minWidth: 170 }}
-                  >
+                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || !publicKey || loading === "create"} style={{ minWidth: 170 }}>
                     {loading === "create" ? "Creating…" : "Create & deposit"}
                   </Button>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
@@ -838,7 +867,7 @@ export default function Page() {
                   userSelect: "none",
                   WebkitUserSelect: "none",
                   touchAction: "manipulation",
-                  cursor: isGoOrJustBecameGo && duel.phase !== "finished" ? "pointer" : "default",
+                  cursor: isGoOrJustBecameGo() && duel.phase !== "finished" ? "pointer" : "default",
                 }}
               >
                 {duel.phase === "lobby" ? (
@@ -874,7 +903,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Timers use a stable UI clock (no blinking). Click timing uses a server-synced timestamp.
+                UI ignores stale server snapshots (prevents “join → back to waiting”).
               </div>
             </Card>
           </div>
