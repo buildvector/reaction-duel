@@ -13,11 +13,23 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "BAD_INPUT" }, { status: 400 });
     }
 
-    // ✅ CRITICAL: Use SERVER time (prevents clock-skew + cheating)
-    const clickedAt = Date.now();
+    const serverNow = Date.now();
+
+    // Prefer client timestamp (captures actual click moment)
+    let clickedAt = Number(body?.clickedAt);
+
+    // Fallback if missing/invalid
+    if (!Number.isFinite(clickedAt)) clickedAt = serverNow;
+
+    // Anti-cheat / sanity: keep within a reasonable window of server time
+    // (your UI already syncs clock, so this won't hurt legit users)
+    const MAX_SKEW_MS = 1500;
+    if (clickedAt < serverNow - MAX_SKEW_MS) clickedAt = serverNow - MAX_SKEW_MS;
+    if (clickedAt > serverNow + MAX_SKEW_MS) clickedAt = serverNow + MAX_SKEW_MS;
 
     const duel = await applyClick({ duelId, who, clickedAt });
-    return NextResponse.json({ duel, serverNow: Date.now() });
+
+    return NextResponse.json({ duel, serverNow });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "UNKNOWN" }, { status: 500 });
   }
