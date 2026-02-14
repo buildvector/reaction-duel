@@ -81,7 +81,7 @@ async function postJSON<T>(url: string, body: any): Promise<T> {
 }
 
 /**
- * IMPORTANT: no-store + cache-bust to avoid Chrome/Vercel/CDN serving stale duel state.
+ * IMPORTANT: no-store + cache-bust to avoid stale duel state.
  */
 async function getJSON<T>(url: string): Promise<T> {
   const u = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
@@ -273,22 +273,30 @@ export default function Page() {
   const [loading, setLoading] = useState<string | null>(null);
 
   const [openDuels, setOpenDuels] = useState<Duel[]>([]);
-  const [historyDuels, setHistoryDuels] = useState<Duel[]>([]);
-
   const [openRefreshing, setOpenRefreshing] = useState(false);
 
   const [mounted, setMounted] = useState(false);
-  const [nowMs, setNowMs] = useState(0);
+
+  /**
+   * ✅ Stable "server-synced" clock:
+   * uiNow = Date.now() + offset
+   * offset is smoothed when we receive serverNow, so timers don't jump backwards/forwards.
+   */
+  const offsetRef = useRef<number | null>(null);
+  const lastServerNowRef = useRef<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(Date.now());
+
+  const uiNow = () => Date.now() + (offsetRef.current ?? 0);
 
   useEffect(() => {
     setMounted(true);
     setNowMs(Date.now());
   }, []);
 
-  // 20Hz local clock for UI countdowns (independent of server polling jitter)
+  // 20Hz UI clock tick (smooth, monotonic-ish)
   useEffect(() => {
     if (!mounted) return;
-    const i = setInterval(() => setNowMs(Date.now()), 50);
+    const i = setInterval(() => setNowMs(uiNow()), 50);
     return () => clearInterval(i);
   }, [mounted]);
 
@@ -312,13 +320,32 @@ export default function Page() {
           `/api/duel/get?duelId=${encodeURIComponent(duelId)}`
         );
         if (!alive) return;
+
         setDuel(fresh);
-        setNowMs(typeof serverNow === "number" ? serverNow : Date.now());
+
+        // ✅ update offset smoothly (never snap UI time)
+        if (typeof serverNow === "number") {
+          lastServerNowRef.current = serverNow;
+          const targetOffset = serverNow - Date.now();
+
+          if (offsetRef.current == null) {
+            offsetRef.current = targetOffset;
+          } else {
+            // Smooth towards target. (0.15 = fairly responsive but stable)
+            const alpha = 0.15;
+
+            // Prevent insane jumps (cold start / very delayed response)
+            const clamp = 2000; // ms
+            const delta = Math.max(-clamp, Math.min(clamp, targetOffset - offsetRef.current));
+
+            offsetRef.current = offsetRef.current + delta * alpha;
+          }
+        }
       } catch {}
     };
 
     tick();
-    const i = setInterval(tick, 250);
+    const i = setInterval(tick, 500); // slower poll reduces noise; UI still updates at 50ms
     return () => {
       alive = false;
       clearInterval(i);
@@ -354,57 +381,6 @@ export default function Page() {
       clearInterval(i);
     };
   }, [duelId]);
-
-  useEffect(() => {
-    if (!connected || !me) {
-      setHistoryDuels([]);
-      return;
-    }
-
-    let alive = true;
-    const tick = async () => {
-      try {
-        const { duels } = await getJSON<{ duels: Duel[] }>(
-          `/api/duel/history?pubkey=${encodeURIComponent(me)}&limit=10`
-        );
-        if (alive) setHistoryDuels(duels ?? []);
-      } catch {}
-    };
-
-    tick();
-    const i = setInterval(tick, 3000);
-    return () => {
-      alive = false;
-      clearInterval(i);
-    };
-  }, [connected, me]);
-
-  const historyUnique = useMemo(() => {
-    const map = new Map<string, Duel>();
-    for (const d of historyDuels) map.set(d.duelId, d);
-    return Array.from(map.values());
-  }, [historyDuels]);
-
-  const displayPhase: DuelPhase = useMemo(() => {
-    if (!duel) return "lobby";
-    if (duel.phase === "finished") return "finished";
-
-    const t = nowMs || Date.now();
-
-    if (duel.revealAt && duel.goAt) {
-      if (t < duel.revealAt) return "countdown";
-      if (t < duel.goAt) return "waiting_random";
-      return "go";
-    }
-
-    if (duel.phase !== "lobby") return duel.phase;
-    return "lobby";
-  }, [duel, nowMs]);
-
-  const clickedLocalRef = useRef(false);
-  useEffect(() => {
-    clickedLocalRef.current = false;
-  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB, displayPhase]);
 
   const payoutInFlight = useRef(false);
   useEffect(() => {
@@ -576,11 +552,32 @@ export default function Page() {
     setDuel(null);
   }
 
+  const clickedLocalRef = useRef(false);
+  useEffect(() => {
+    clickedLocalRef.current = false;
+  }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
+
   const feeLamports = duel ? Math.floor((duel.stakeLamports * duel.feeBps) / 10_000) : 0;
   const netLamports = duel ? Math.max(0, duel.stakeLamports - feeLamports) : 0;
   const potLamports = duel ? netLamports * 2 : 0;
 
   const feePct = "3";
+
+  const displayPhase: DuelPhase = useMemo(() => {
+    if (!duel) return "lobby";
+    if (duel.phase === "finished") return "finished";
+
+    const t = nowMs || Date.now();
+
+    if (duel.revealAt && duel.goAt) {
+      if (t < duel.revealAt) return "countdown";
+      if (t < duel.goAt) return "waiting_random";
+      return "go";
+    }
+
+    if (duel.phase !== "lobby") return duel.phase;
+    return "lobby";
+  }, [duel, nowMs]);
 
   const countdownText = useMemo(() => {
     if (!mounted) return "";
@@ -654,8 +651,8 @@ export default function Page() {
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 800 }}>Create duel</div>
                     <Hint style={{ marginTop: 6 }}>
-                      Deposit goes to treasury.{" "}
-                      <span style={{ color: "rgba(231,234,242,0.9)" }}>{feePct}%</span> fee is taken instantly.
+                      Deposit goes to treasury. <span style={{ color: "rgba(231,234,242,0.9)" }}>{feePct}%</span> fee is taken
+                      instantly.
                     </Hint>
                   </div>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>min {MIN_BET} SOL</div>
@@ -707,12 +704,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                  <Button
-                    variant="primary"
-                    onClick={createDuelPaid}
-                    disabled={!connected || loading === "create"}
-                    style={{ minWidth: 170 }}
-                  >
+                  <Button variant="primary" onClick={createDuelPaid} disabled={!connected || loading === "create"} style={{ minWidth: 170 }}>
                     {loading === "create" ? "Creating…" : "Create & deposit"}
                   </Button>
                   <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
@@ -720,54 +712,6 @@ export default function Page() {
                   </div>
                 </div>
               </Card>
-
-              {/* Optional: keep your history card if you want (your snippet had removed it) */}
-              {historyUnique.length > 0 ? (
-                <Card>
-                  <div style={{ fontSize: 14, fontWeight: 800 }}>History</div>
-                  <Hint style={{ marginTop: 6 }}>Your latest 10 duels (creator or joiner).</Hint>
-
-                  <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
-                    {historyUnique.map((r) => (
-                      <div
-                        key={r.duelId}
-                        onClick={() => setDuel(r)}
-                        className="glass"
-                        style={{
-                          borderRadius: 16,
-                          padding: 12,
-                          cursor: "pointer",
-                          border: "1px solid rgba(255,255,255,0.10)",
-                          background: "rgba(255,255,255,0.05)",
-                        }}
-                        title="Click to open"
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                              <div style={{ fontWeight: 800 }}>{solFromLamports(r.stakeLamports).toFixed(2)} SOL</div>
-                              <Hint>
-                                duel{" "}
-                                <span className="mono" style={{ color: "rgba(231,234,242,0.9)" }}>
-                                  {r.duelId}
-                                </span>
-                              </Hint>
-                            </div>
-
-                            <div style={{ marginTop: 6, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                              A {short(r.createdBy)} · B {r.joinedBy ? short(r.joinedBy) : "—"}
-                            </div>
-                          </div>
-
-                          <div style={{ fontSize: 12, color: "rgba(231,234,242,0.55)", whiteSpace: "nowrap" }}>
-                            {new Date(r.updatedAt).toLocaleString()}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-              ) : null}
             </div>
 
             <Card>
@@ -848,30 +792,11 @@ export default function Page() {
                   <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                     <Pill
                       label={`phase: ${displayPhase}`}
-                      tone={
-                        displayPhase === "go"
-                          ? "green"
-                          : displayPhase === "waiting_random"
-                          ? "purple"
-                          : displayPhase === "countdown"
-                          ? "purple"
-                          : "neutral"
-                      }
+                      tone={displayPhase === "go" ? "green" : displayPhase === "waiting_random" ? "purple" : displayPhase === "countdown" ? "purple" : "neutral"}
                     />
-                    {duel.phase === "finished" ? (
-                      <Pill
-                        label={duel.payoutSig ? "payout: sent" : "payout: pending"}
-                        tone={duel.payoutSig ? "green" : "purple"}
-                      />
-                    ) : null}
                   </div>
 
-                  <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.75)" }}>
-                    Stake: <b>{solFromLamports(duel.stakeLamports).toFixed(2)} SOL</b> · Fee:{" "}
-                    <b>{solFromLamports(feeLamports).toFixed(4)} SOL</b> · Pot: <b>{solFromLamports(potLamports).toFixed(4)} SOL</b>
-                  </div>
-
-                  <div style={{ marginTop: 8, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
+                  <div style={{ marginTop: 10, fontSize: 13, color: "rgba(231,234,242,0.70)" }}>
                     A: <span className="mono">{short(duel.createdBy)}</span>{" "}
                     {duel.joinedBy ? (
                       <>
@@ -891,7 +816,7 @@ export default function Page() {
                 </div>
 
                 <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <Button variant="ghost" onClick={() => setDuel(null)} style={{ opacity: 0.9 }}>
+                  <Button variant="ghost" onClick={reset} style={{ opacity: 0.9 }}>
                     Back to lobby
                   </Button>
                 </div>
@@ -962,15 +887,6 @@ export default function Page() {
                     </div>
                     <div style={{ marginTop: 10, fontSize: 20 }}>
                       Winner: <b>{duel.winner ?? "—"}</b>
-                    </div>
-                    <div style={{ marginTop: 10, fontSize: 12, color: "rgba(231,234,242,0.60)" }}>
-                      {duel.payoutSig ? `Payout sent ✅` : `Paying out…`}
-                    </div>
-
-                    <div style={{ marginTop: 14, display: "flex", justifyContent: "center" }}>
-                      <Button variant="primary" onClick={() => setDuel(null)} style={{ minWidth: 190 }}>
-                        Back to lobby
-                      </Button>
                     </div>
                   </div>
                 ) : (
