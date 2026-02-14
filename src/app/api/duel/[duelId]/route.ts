@@ -1,27 +1,21 @@
+// src/app/api/duel/[duelId]/route.ts
 import { NextResponse } from "next/server";
-import { getDuel, setDuel } from "@/lib/duelStore";
+import { getDuel } from "@/lib/duelStore";
 
 export const runtime = "nodejs";
 
-export async function GET(_req: Request, { params }: { params: { duelId: string } }) {
-  const duelId = String(params.duelId || "").toUpperCase();
-  if (!duelId) return NextResponse.json({ error: "Missing duelId" }, { status: 400 });
+export async function GET(
+  _req: Request,
+  { params }: { params: { duelId: string } }
+) {
+  const duelId = String(params?.duelId ?? "").trim().toUpperCase();
+  if (!duelId) return NextResponse.json({ error: "DUEL_ID_REQUIRED" }, { status: 400 });
 
   const duel = await getDuel(duelId);
-  if (!duel) return NextResponse.json({ error: "Not found" }, { status: 404 });
-
-  return NextResponse.json({ duel });
+  return NextResponse.json({ duel: duel ?? null });
 }
 
-// (valgfrit) admin/debug update
-export async function PATCH(req: Request, { params }: { params: { duelId: string } }) {
-  const duelId = String(params.duelId || "").toUpperCase();
-  const duel = await getDuel(duelId);
-  if (!duel) return NextResponse.json({ error: "Not found" }, { status: 404 });
-
-  const body = await req.json();
-  const next = { ...duel, ...body, duelId: duel.duelId };
-  await setDuel(next);
-
-  return NextResponse.json({ duel: next });
+// Optional: block writes on this route (you don't need it)
+export async function POST() {
+  return NextResponse.json({ error: "METHOD_NOT_ALLOWED" }, { status: 405 });
 }
