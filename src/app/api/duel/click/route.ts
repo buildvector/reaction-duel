@@ -6,6 +6,7 @@ export const runtime = "nodejs";
 export async function POST(req: Request) {
   try {
     const body = await req.json();
+
     const duelId = String(body?.duelId ?? "").trim().toUpperCase();
     const who = body?.who === "A" || body?.who === "B" ? body.who : null;
 
@@ -15,18 +16,11 @@ export async function POST(req: Request) {
 
     const serverNow = Date.now();
 
-    // Prefer client timestamp (captures actual click moment)
-    let clickedAt = Number(body?.clickedAt);
+    // Keep client click timestamp only as a hint/debug (NOT used for fairness)
+    const clientAt = Number(body?.clickedAt);
+    const clickedAt = Number.isFinite(clientAt) ? clientAt : serverNow;
 
-    // Fallback if missing/invalid
-    if (!Number.isFinite(clickedAt)) clickedAt = serverNow;
-
-    // Anti-cheat / sanity: keep within a reasonable window of server time
-    // (your UI already syncs clock, so this won't hurt legit users)
-    const MAX_SKEW_MS = 1500;
-    if (clickedAt < serverNow - MAX_SKEW_MS) clickedAt = serverNow - MAX_SKEW_MS;
-    if (clickedAt > serverNow + MAX_SKEW_MS) clickedAt = serverNow + MAX_SKEW_MS;
-
+    // ✅ duelStore expects { clickedAt }
     const duel = await applyClick({ duelId, who, clickedAt });
 
     return NextResponse.json({ duel, serverNow });

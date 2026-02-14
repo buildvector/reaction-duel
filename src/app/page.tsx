@@ -274,13 +274,46 @@ export default function Page() {
     return null;
   }, [duel, connected, publicKey, me]);
 
-  // ✅ Never regress duel state (stale reads guard)
+  // ✅ Never regress duel state (stale reads guard) + never "forget" critical fields
   function applyFreshDuel(fresh: Duel) {
     setDuel((prev) => {
       if (!prev) return fresh;
       if (prev.duelId !== fresh.duelId) return fresh;
-      if (typeof prev.updatedAt === "number" && typeof fresh.updatedAt === "number" && fresh.updatedAt < prev.updatedAt) return prev;
-      return fresh;
+
+      if (typeof prev.updatedAt === "number" && typeof fresh.updatedAt === "number" && fresh.updatedAt < prev.updatedAt) {
+        return prev;
+      }
+
+      const merged: Duel = { ...fresh };
+
+      // Never lose join/ready due to stale replica
+      if (prev.joinedBy && !fresh.joinedBy) merged.joinedBy = prev.joinedBy;
+
+      if (prev.readyA && !fresh.readyA) merged.readyA = true;
+      if (prev.readyB && !fresh.readyB) merged.readyB = true;
+
+      // Never lose payments
+      if (prev.paidA && !fresh.paidA) merged.paidA = true;
+      if (prev.paidB && !fresh.paidB) merged.paidB = true;
+      if (prev.paySigA && !fresh.paySigA) merged.paySigA = prev.paySigA;
+      if (prev.paySigB && !fresh.paySigB) merged.paySigB = prev.paySigB;
+
+      // Never lose timing fields
+      if (prev.revealAt && !fresh.revealAt) merged.revealAt = prev.revealAt;
+      if (prev.goAt && !fresh.goAt) merged.goAt = prev.goAt;
+
+      // Never lose clicks
+      if (prev.clickA != null && fresh.clickA == null) merged.clickA = prev.clickA;
+      if (prev.clickB != null && fresh.clickB == null) merged.clickB = prev.clickB;
+
+      if (prev.firstClickAt && !fresh.firstClickAt) merged.firstClickAt = prev.firstClickAt;
+      if (prev.finalizeAt && !fresh.finalizeAt) merged.finalizeAt = prev.finalizeAt;
+
+      // Never lose winner/payout once set
+      if (prev.winner && !fresh.winner) merged.winner = prev.winner;
+      if (prev.payoutSig && !fresh.payoutSig) merged.payoutSig = prev.payoutSig;
+
+      return merged;
     });
   }
 
@@ -539,21 +572,21 @@ export default function Page() {
 
     setLoading("ready");
     try {
+      // optimistic UI: set local ready immediately
+      setDuel((prev) => {
+        if (!prev) return prev;
+        const next = { ...prev };
+        if (myRole === "A") next.readyA = true;
+        if (myRole === "B") next.readyB = true;
+        return next;
+      });
+
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/ready", {
         duelId: duel.duelId,
         pubkey: me,
       });
 
-      setDuel((prev) => {
-        if (!prev) return next;
-        if (prev.duelId !== next.duelId) return next;
-
-        const merged = { ...prev, ...next } as Duel;
-        if (myRole === "A") merged.readyA = true;
-        if (myRole === "B") merged.readyB = true;
-        return merged;
-      });
-
+      applyFreshDuel(next);
       await hardSync(duel.duelId);
     } catch (e: any) {
       alert(e?.message ?? "Ready failed");
@@ -596,7 +629,6 @@ export default function Page() {
     clickedLocalRef.current = false;
   }, [duelId, duel?.phase, duel?.clickA, duel?.clickB]);
 
-  // ✅ allow clicking during countdown/waiting/go — server decides if early = lose
   const canClick = !!duel && !!myRole && duel.phase !== "finished" && duel.phase !== "lobby";
 
   async function clickDuel() {
@@ -608,11 +640,9 @@ export default function Page() {
     if (clickedLocalRef.current) return;
     clickedLocalRef.current = true;
 
-    // IMPORTANT: capture click moment immediately (before any await/sync)
-    const clickedAt = uiNow();
+    const clickedAt = uiNow(); // kept for compatibility
 
     try {
-      // fire-and-forget sync (doesn't shift the click timestamp)
       hardSync(duel.duelId);
 
       const { duel: next } = await postJSON<{ duel: Duel }>("/api/duel/click", {
@@ -981,7 +1011,7 @@ export default function Page() {
                   e.preventDefault();
                   clickDuel();
                 }}
-                onClick={() => clickDuel()} // ✅ fallback
+                onClick={() => clickDuel()}
                 style={{
                   marginTop: 16,
                   height: 280,
@@ -1029,7 +1059,7 @@ export default function Page() {
               </div>
 
               <div style={{ marginTop: 12, fontSize: 12, color: "rgba(231,234,242,0.55)" }}>
-                Fix: UI no longer blocks early clicks — server decides (early = loss).
+                Fix: server decides early clicks + UI never regresses join/ready due to stale reads.
               </div>
             </Card>
           </div>

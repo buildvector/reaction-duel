@@ -76,7 +76,6 @@ async function redis<T>(command: string, ...args: any[]): Promise<T> {
     Authorization: `Bearer ${token}`,
   };
 
-  // ✅ Send RYW token if we have one
   if (_syncToken) headers["upstash-sync-token"] = _syncToken;
 
   const res = await fetch(path, {
@@ -84,7 +83,6 @@ async function redis<T>(command: string, ...args: any[]): Promise<T> {
     cache: "no-store",
   });
 
-  // ✅ Capture latest RYW token from response (reads and writes both return it)
   const newToken = res.headers.get("upstash-sync-token");
   if (newToken) _syncToken = newToken;
 
@@ -193,11 +191,6 @@ async function saveDuel(duel: Duel) {
   await redis("set", duelKey(duel.duelId), JSON.stringify(duel));
 }
 
-/**
- * ✅ "Best effort" read-repair:
- * If Upstash replica returns stale, the next read *usually* catches up
- * when using the sync token. We also retry once quickly if needed.
- */
 async function getDuelRaw(id: string): Promise<Duel | null> {
   const raw = await redis<string | null>("get", duelKey(id));
   if (!raw) return null;
@@ -211,7 +204,6 @@ async function getDuelRaw(id: string): Promise<Duel | null> {
 export async function getDuel(id: string): Promise<Duel | null> {
   const duelId = id.toUpperCase();
 
-  // First attempt
   let duel = await getDuelRaw(duelId);
   if (!duel) return null;
 
@@ -227,8 +219,6 @@ export async function getDuel(id: string): Promise<Duel | null> {
     await saveDuel(duel);
   }
 
-  // Quick second read to reduce “write then immediate stale read” windows
-  // (helps especially right after join/ready)
   const duel2 = await getDuelRaw(duelId);
   if (duel2 && duel2.updatedAt >= duel.updatedAt) duel = duel2;
 
@@ -357,7 +347,11 @@ async function recordHistoryIfFinished(duel: Duel) {
 }
 
 /* ---------------- CLICK ---------------- */
-
+/**
+ * NOTE:
+ * - input.clickedAt is kept for compatibility with your existing UI.
+ * - Fairness/early-click is decided by server time (t = now()) to avoid clock skew + clamp issues.
+ */
 export async function applyClick(input: { duelId: string; who: "A" | "B"; clickedAt: number }): Promise<Duel> {
   const duel = await getDuel(input.duelId);
   if (!duel) throw new Error("DUEL_NOT_FOUND");
@@ -366,7 +360,9 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
   if (!duel.paidA || !duel.paidB) throw new Error("NOT_PAID");
   if (isFinishedPhase(duel.phase)) return duel;
 
+  // Canonical time: server receipt time
   const t = now();
+
   advancePhase(duel, t);
   finalizeIfOverdueInternal(duel, t);
   if (isFinishedPhase(duel.phase)) {
@@ -374,7 +370,8 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
     return duel;
   }
 
-  if (input.clickedAt < duel.goAt) {
+  // ✅ Early click = lose (server authoritative)
+  if (t < duel.goAt) {
     if (input.who === "A") duel.falseA = true;
     else duel.falseB = true;
 
@@ -387,20 +384,8 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
     return duel;
   }
 
-  const reactionMs = Math.max(0, input.clickedAt - duel.goAt);
-
-  if (reactionMs < 120) {
-    if (input.who === "A") duel.falseA = true;
-    else duel.falseB = true;
-
-    duel.winner = input.who === "A" ? "B" : "A";
-    duel.phase = "finished";
-    duel.finishedAt = t;
-
-    await saveDuel(duel);
-    await recordHistoryIfFinished(duel);
-    return duel;
-  }
+  // ✅ Reaction time based on server time (stable)
+  const reactionMs = Math.max(0, t - duel.goAt);
 
   if (input.who === "A") {
     if (duel.clickA != null) return duel;
@@ -424,7 +409,6 @@ export async function applyClick(input: { duelId: string; who: "A" | "B"; clicke
   }
 
   await saveDuel(duel);
-
   if (isFinishedPhase(duel.phase)) await recordHistoryIfFinished(duel);
   return duel;
 }
