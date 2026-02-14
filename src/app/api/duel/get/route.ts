@@ -7,21 +7,25 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+const noStoreHeaders = {
+  "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+  Pragma: "no-cache",
+  Expires: "0",
+};
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const duelId = String(url.searchParams.get("duelId") ?? "")
-      .trim()
-      .toUpperCase();
+    const duelId = String(url.searchParams.get("duelId") ?? "").trim().toUpperCase();
 
     if (!duelId) {
-      return NextResponse.json({ error: "BAD_INPUT" }, { status: 400 });
+      return NextResponse.json({ error: "BAD_INPUT" }, { status: 400, headers: noStoreHeaders });
     }
 
     const duel = await getDuel(duelId);
 
     if (!duel) {
-      return NextResponse.json({ error: "DUEL_NOT_FOUND" }, { status: 404 });
+      return NextResponse.json({ error: "DUEL_NOT_FOUND" }, { status: 404, headers: noStoreHeaders });
     }
 
     return NextResponse.json(
@@ -29,25 +33,9 @@ export async function GET(req: Request) {
         duel,
         serverNow: Date.now(),
       },
-      {
-        headers: {
-          "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-          Pragma: "no-cache",
-          Expires: "0",
-        },
-      }
+      { headers: noStoreHeaders }
     );
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? "UNKNOWN" },
-      {
-        status: 500,
-        headers: {
-          "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-          Pragma: "no-cache",
-          Expires: "0",
-        },
-      }
-    );
+    return NextResponse.json({ error: e?.message ?? "UNKNOWN" }, { status: 500, headers: noStoreHeaders });
   }
 }
